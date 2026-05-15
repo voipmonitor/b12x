@@ -87,13 +87,11 @@ def _nvfp4_compute_scale_factor(
 ) -> float:
     if a_dtype == torch.float16:
         return 1.0
-    ws_float = packed_scales.float() * (2**7)
-    nonzero_mask = ws_float > 0
-    if bool(nonzero_mask.any().item()):
-        max_val = ws_float[nonzero_mask].max()
-        max_scalar = float(max_val.item())
-        if max_scalar < 448 * (2**7):
-            return float(2 ** math.floor(math.log2((448 * (2**7)) / max_scalar)))
+    if packed_scales.numel() == 0:
+        return 1.0
+    max_scalar = float(packed_scales.max().item()) * (2**7)
+    if max_scalar > 0 and max_scalar < 448 * (2**7):
+        return float(2 ** math.floor(math.log2((448 * (2**7)) / max_scalar)))
     return 1.0
 
 
