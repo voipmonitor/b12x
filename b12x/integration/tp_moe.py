@@ -441,6 +441,21 @@ def _get_activation_kernel_spec(
         raise ValueError(f"unsupported activation {activation!r}") from exc
 
 
+def _normalize_workspace_activation(
+    activation: str,
+    *,
+    quant_mode: str,
+) -> str:
+    if _normalize_quant_mode(quant_mode) == "w4a16":
+        from b12x.moe.fused.w4a16.host import validate_activation
+
+        validate_activation(activation)
+        return activation
+    return _get_activation_kernel_spec(
+        activation, quant_mode=quant_mode
+    ).activation
+
+
 def _activation_w1_rows(activation: str, n: int) -> int:
     if activation == "silu":
         return 2 * n
@@ -935,7 +950,7 @@ def _plan_core_workspace(
     dynamic_task_capacity: int | None = None,
 ) -> _TPCoreWorkspacePlan:
     quant_mode = _normalize_quant_mode(quant_mode)
-    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
+    activation = _normalize_workspace_activation(activation, quant_mode=quant_mode)
     if implementation == "w4a16":
         from b12x.moe.fused.w4a16.host import (
             _W4A16_ALLOWED_ROUTED_SIZES,
@@ -944,7 +959,7 @@ def _plan_core_workspace(
         )
 
         routed_capacity = max(int(routed_rows), 1)
-        fc1_cols = activation_spec.w1_rows(int(n))
+        fc1_cols = _activation_w1_rows(activation, int(n))
         route_slots_capacity = 1
         route_blocks_capacity = 1
         fc1_c_tmp_elements = 1
@@ -980,7 +995,7 @@ def _plan_core_workspace(
         return _TPCoreWorkspacePlan(
             implementation=implementation,
             quant_mode=quant_mode,
-            activation=activation_spec.activation,
+            activation=activation,
             state_E=state_E,
             weight_E=weight_E,
             routed_rows=routed_capacity,
@@ -1014,6 +1029,7 @@ def _plan_core_workspace(
             ),
         )
 
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
     direct_micro_k_supported = (
@@ -1603,9 +1619,7 @@ def _make_workspace_plan(
     activation: str = "silu",
 ) -> TPMoEPlan:
     quant_mode = _normalize_quant_mode(quant_mode)
-    activation = _get_activation_kernel_spec(
-        activation, quant_mode=quant_mode
-    ).activation
+    activation = _normalize_workspace_activation(activation, quant_mode=quant_mode)
     routed_rows = num_tokens * num_topk
     implementation, state_E, max_rows = _resolve_workspace_layout(
         num_tokens=num_tokens,
