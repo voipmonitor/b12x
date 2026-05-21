@@ -207,11 +207,21 @@ def _repack_4bit_no_perm(
 
 
 def _repack_weight(weight: torch.Tensor, *, size_k: int, size_n: int) -> torch.Tensor:
-    pieces = []
+    out_shape = (
+        weight.shape[0],
+        size_k // _PACKED_TILE_SIZE,
+        (size_n // _PACKED_TILE_N_SIZE) * 128,
+    )
+    output = torch.empty(out_shape, device=weight.device, dtype=torch.int32)
     for expert in range(weight.shape[0]):
-        qweight = weight[expert].view(torch.int32).T.contiguous()
-        pieces.append(_repack_4bit_no_perm(qweight, size_k=size_k, size_n=size_n))
-    return torch.stack(pieces, dim=0).contiguous()
+        # Keep the temporary contiguous copy expert-local. Materializing the
+        # entire expert tensor, then stacking all repacked pieces, creates a
+        # large transient peak during server startup.
+        qweight = weight[expert].contiguous().view(torch.int32).T.contiguous()
+        output[expert].copy_(
+            _repack_4bit_no_perm(qweight, size_k=size_k, size_n=size_n)
+        )
+    return output
 
 
 def _permute_nvfp4_scales(
@@ -224,27 +234,39 @@ def _permute_nvfp4_scales(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     scales = scales.to(a_dtype)
     combined_scale_factor = _nvfp4_compute_scale_factor(scales, a_dtype)
-    pieces = []
+    sample = _process_nvfp4_packed_scales(
+        _permute_packed_scales(
+            scales[0].T,
+            size_k=size_k,
+            size_n=size_n,
+            group_size=16,
+        ),
+        scale_factor=combined_scale_factor,
+    )
+    packed_scale_rows = torch.empty(
+        (scales.shape[0], *sample.shape), device=scales.device, dtype=sample.dtype
+    )
+    packed_scale_rows[0].copy_(sample)
     for expert in range(scales.shape[0]):
-        packed_scales = _permute_packed_scales(
+        if expert == 0:
+            continue
+        permuted = _permute_packed_scales(
             scales[expert].T,
             size_k=size_k,
             size_n=size_n,
             group_size=16,
         )
-        pieces.append(
+        packed_scale_rows[expert].copy_(
             _process_nvfp4_packed_scales(
-                packed_scales,
-                scale_factor=combined_scale_factor,
+                permuted, scale_factor=combined_scale_factor
             )
         )
-    packed_scales = torch.stack(pieces, dim=0).contiguous()
     packed_global = _process_nvfp4_packed_global_scale(
         global_scales,
         a_dtype=a_dtype,
     ).to(torch.float32)
     packed_global = packed_global / combined_scale_factor
-    return packed_scales, packed_global.contiguous()
+    return packed_scale_rows, packed_global.contiguous()
 
 
 def prepare_w4a16_packed_weights(
@@ -292,9 +314,9 @@ def prepare_w4a16_packed_weights(
         cols=intermediate_size,
     )
 
-    packed_w13 = _repack_weight(w13.contiguous(), size_k=hidden_size, size_n=w13_rows)
+    packed_w13 = _repack_weight(w13, size_k=hidden_size, size_n=w13_rows)
     packed_w2 = _repack_weight(
-        w2_fp4.contiguous(), size_k=intermediate_size, size_n=hidden_size
+        w2_fp4, size_k=intermediate_size, size_n=hidden_size
     )
     w13_global_scale = _source_global_scale(
         w13_global_scale,
