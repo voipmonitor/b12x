@@ -112,6 +112,52 @@ def _apply_mla_prefill_strategy(
     return split_cfg
 
 
+def _get_mla_output_buffer(
+    *,
+    workspace: B12XAttentionWorkspace,
+    q_all: torch.Tensor,
+    v_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    live_q_rows = int(q_all.shape[0])
+    output_rows = (
+        int(workspace.max_total_q)
+        if (workspace.fixed_capacity or workspace.use_cuda_graph)
+        else live_q_rows
+    )
+    num_heads = int(q_all.shape[1])
+    v_head_dim = int(v_head_dim)
+    buffer = workspace.output_buffer
+    if buffer is not None:
+        if buffer.device != q_all.device or buffer.dtype != q_all.dtype:
+            raise RuntimeError(
+                "workspace MLA output buffer has wrong device or dtype: "
+                f"device={buffer.device} dtype={buffer.dtype}, "
+                f"expected device={q_all.device} dtype={q_all.dtype}"
+            )
+        if (
+            int(buffer.shape[0]) < output_rows
+            or int(buffer.shape[1]) < num_heads
+            or int(buffer.shape[2]) < v_head_dim
+        ):
+            raise RuntimeError(
+                "workspace MLA output buffer is smaller than the active contract: "
+                f"buffer={tuple(buffer.shape)}, required=({output_rows}, {num_heads}, {v_head_dim})"
+            )
+        output_buffer = buffer[:output_rows, :num_heads, :v_head_dim]
+    else:
+        if workspace.fixed_capacity or workspace.use_cuda_graph:
+            raise RuntimeError(
+                "workspace is missing the fixed-capacity MLA output buffer"
+            )
+        output_buffer = torch.empty(
+            (output_rows, num_heads, v_head_dim),
+            dtype=q_all.dtype,
+            device=q_all.device,
+        )
+
+    return output_buffer, output_buffer[:live_q_rows], output_rows
+
+
 def sparse_mla_decode_forward(
     *,
     q_all: torch.Tensor,
@@ -349,9 +395,23 @@ def _run_sparse_mla(
     if split_cfg is not None:
         if workspace.tmp_output is None or workspace.tmp_lse is None:
             raise RuntimeError("workspace is missing split MLA buffers")
-        if not _is_cuda_graph_capture_active(q_all.device) or not (
-            workspace.fixed_capacity or workspace.use_cuda_graph
-        ):
+        capturing = _is_cuda_graph_capture_active(q_all.device)
+        current_chunk = getattr(workspace, "kv_chunk_size_value", None)
+        current_chunks = getattr(workspace, "num_chunks_value", None)
+        split_config_matches = (
+            current_chunk == int(split_cfg.chunk_size)
+            and current_chunks == int(split_cfg.num_chunks)
+        )
+        if not split_config_matches:
+            if capturing and (workspace.fixed_capacity or workspace.use_cuda_graph) and (
+                current_chunk is not None or current_chunks is not None
+            ):
+                raise RuntimeError(
+                    "B12X sparse MLA split chunk config changed during CUDA graph "
+                    "capture: "
+                    f"current=({current_chunk},{current_chunks}) "
+                    f"requested=({split_cfg.chunk_size},{split_cfg.num_chunks})"
+                )
             workspace.set_split_chunk_config(
                 kv_chunk_size=split_cfg.chunk_size,
                 num_chunks=split_cfg.num_chunks,
@@ -361,10 +421,14 @@ def _run_sparse_mla(
             if (workspace.fixed_capacity or workspace.use_cuda_graph)
             else split_cfg.num_chunks
         )
-        output = torch.empty(
-            (q_all.shape[0], q_all.shape[1], v_head_dim),
-            dtype=q_all.dtype,
-            device=q_all.device,
+        # CUDA-graph/fixed-capacity split decode uses capacity-sized temporary
+        # state. Keep the merge output capacity-sized and workspace-backed as
+        # well so the compiled contract and memory footprint are known before
+        # KV cache sizing.
+        output_buffer, output, output_rows = _get_mla_output_buffer(
+            workspace=workspace,
+            q_all=q_all,
+            v_head_dim=v_head_dim,
         )
         assert workspace.kv_chunk_size_ptr is not None
         assert workspace.num_chunks_ptr is not None
@@ -378,7 +442,7 @@ def _run_sparse_mla(
             num_chunks_ptr=workspace.num_chunks_ptr,
             tmp_output=workspace.tmp_output,
             tmp_lse=workspace.tmp_lse,
-            output=output,
+            output=output_buffer,
             launch_num_chunks=launch_num_chunks,
             attn_sink=attn_sink,
             workspace=workspace,
@@ -408,10 +472,10 @@ def _run_sparse_mla(
                 "B12X sparse MLA attn_sink output requires the split path, but no split "
                 "configuration was available for this contract."
             )
-        output = torch.empty(
-            (q_all.shape[0], q_all.shape[1], v_head_dim),
-            dtype=q_all.dtype,
-            device=q_all.device,
+        output_buffer, output, _ = _get_mla_output_buffer(
+            workspace=workspace,
+            q_all=q_all,
+            v_head_dim=v_head_dim,
         )
         run_sparse_mla_kernel(
             q_all=q_all,
@@ -419,7 +483,7 @@ def _run_sparse_mla(
             page_table_1=selected_indices,
             active_token_counts=active_token_counts,
             sm_scale=sm_scale_tensor,
-            output=output,
+            output=output_buffer,
             workspace=workspace,
             identity_page_table=identity_page_table,
         )
@@ -461,14 +525,25 @@ def _final_lse_from_split_workspace(
 ) -> torch.Tensor:
     if workspace.tmp_lse is None:
         raise RuntimeError("workspace is missing split MLA LSE buffer")
+    if workspace.final_lse is None:
+        raise RuntimeError("workspace is missing split MLA final LSE buffer")
     chunk_count = max(1, min(int(launch_num_chunks), int(workspace.tmp_lse.shape[-1])))
-    chunk_lse_base2 = workspace.tmp_lse[:q_rows, :num_heads, :chunk_count].to(
-        torch.float32
-    )
-    lse_natural = torch.logsumexp(chunk_lse_base2 * _LN2, dim=-1)
+    chunk_lse = workspace.tmp_lse[:q_rows, :num_heads, :chunk_count]
+    final_lse = workspace.final_lse[:q_rows, :num_heads]
+    if chunk_lse.dtype != torch.float32:
+        raise RuntimeError(
+            f"B12X sparse MLA split LSE scratch must be float32, got {chunk_lse.dtype}"
+        )
+    # Split kernels accumulate LSE in base2. Convert the live scratch to natural
+    # log scale in-place after the merge has consumed it, then reduce into a
+    # workspace-backed output so CUDA graph capture does not own an allocator
+    # tensor for the DCP verifier path.
+    chunk_lse.mul_(_LN2)
+    torch.logsumexp(chunk_lse, dim=-1, out=final_lse)
     if scale == "natural":
-        return lse_natural
-    return lse_natural / _LN2
+        return final_lse
+    final_lse.div_(_LN2)
+    return final_lse
 
 
 def _get_sm_scale_tensor(

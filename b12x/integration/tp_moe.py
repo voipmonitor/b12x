@@ -1989,21 +1989,28 @@ def _w4a16_preplanned_launches(
     workspace: TPW4A16Workspace,
     *,
     token_count: int,
+    sum_token_count: int | None = None,
 ) -> tuple[object | None, object | None]:
     token_count = int(token_count)
+    sum_token_count = token_count if sum_token_count is None else int(sum_token_count)
     if not workspace.planned_token_counts:
         return None, None
-    if token_count not in workspace.planned_token_counts:
+    missing_counts = {
+        count
+        for count in (token_count, sum_token_count)
+        if count not in workspace.planned_token_counts
+    }
+    if missing_counts:
         raise RuntimeError(
-            "W4A16 MoE workspace was asked to launch an unplanned token count: "
-            f"tokens={token_count}, planned={sorted(workspace.planned_token_counts)}"
+            "W4A16 MoE workspace was asked to launch unplanned token count(s): "
+            f"tokens={sorted(missing_counts)}, planned={sorted(workspace.planned_token_counts)}"
         )
     fused = workspace.planned_fused_moe_launches.get(token_count)
-    topk_sum = workspace.planned_topk_sum_launches.get(token_count)
+    topk_sum = workspace.planned_topk_sum_launches.get(sum_token_count)
     if fused is None or topk_sum is None:
         raise RuntimeError(
             "W4A16 MoE workspace is missing preplanned launches for "
-            f"tokens={token_count}"
+            f"tokens={token_count}, sum_tokens={sum_token_count}"
         )
     return fused, topk_sum
 
@@ -4033,6 +4040,8 @@ def b12x_moe_fp4(
     fast_math: bool | None = None,
     activation: str = "silu",
     quant_mode: str | None = None,
+    launch_rows: int | None = None,
+    output_rows: int | None = None,
     unit_scale_contract: bool = False,
     source_format: str = "modelopt",
     prepared_w4a16: object | None = None,
@@ -4054,6 +4063,7 @@ def b12x_moe_fp4(
     )
     num_topk = topk_ids.shape[1]
     m, k = a.shape
+    input_m = m
     device = a.device
     if prepared_w4a16 is not None:
         if quant_mode != "w4a16":
@@ -4107,17 +4117,32 @@ def b12x_moe_fp4(
     if quant_mode == "w4a16":
         from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
 
+        launch_m = input_m if launch_rows is None else int(launch_rows)
+        if launch_m < input_m:
+            raise ValueError(
+                f"launch_rows must be >= input rows {input_m}, got {launch_m}"
+            )
+        if int(topk_ids.shape[0]) != launch_m or int(topk_weights.shape[0]) != launch_m:
+            raise ValueError(
+                f"W4A16 topk tensors must have {launch_m} rows for launch_rows"
+            )
         if output is None:
             if torch.cuda.is_current_stream_capturing():
                 raise ValueError(
                     "CUDA graph capture requires a caller-owned output buffer"
                 )
-            scatter_output = torch.empty(m, k, dtype=a.dtype, device=device)
+            scatter_output = torch.empty(input_m, k, dtype=a.dtype, device=device)
         else:
             scatter_output = output
-        if scatter_output.shape != (m, k):
+        scatter_rows = input_m if output_rows is None else int(output_rows)
+        if scatter_rows <= 0 or scatter_rows > input_m:
             raise ValueError(
-                f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}"
+                f"output_rows must be in [1, {input_m}], got {scatter_rows}"
+            )
+        if scatter_output.shape != (scatter_rows, k):
+            raise ValueError(
+                f"output must have shape {(scatter_rows, k)}, "
+                f"got {tuple(scatter_output.shape)}"
             )
         if scatter_output.dtype != a.dtype:
             raise ValueError(
@@ -4144,7 +4169,7 @@ def b12x_moe_fp4(
                 source_format=source_format,
             )
         plan = _make_workspace_plan(
-            num_tokens=m,
+            num_tokens=launch_m,
             weight_E=weight_E,
             k=k,
             n=n,
@@ -4179,7 +4204,8 @@ def b12x_moe_fp4(
             topk_ids = topk_ids.contiguous()
         fused_launch, topk_sum_launch = _w4a16_preplanned_launches(
             w4a16_workspace,
-            token_count=m,
+            token_count=launch_m,
+            sum_token_count=scatter_rows,
         )
         return run_w4a16_moe(
             a,
@@ -4189,6 +4215,7 @@ def b12x_moe_fp4(
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             fast_math=fast_math,
+            launch_rows=launch_m,
             intermediate_cache13=w4a16_workspace.intermediate_cache13,
             intermediate_cache2=w4a16_workspace.intermediate_cache2,
             output=scatter_output,
@@ -4201,6 +4228,7 @@ def b12x_moe_fp4(
             swiglu_limit=swiglu_limit,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+            output_rows=scatter_rows,
         )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     if quant_mode == "nvfp4" and _is_exact_relu2_bs1_nemotron_case(
