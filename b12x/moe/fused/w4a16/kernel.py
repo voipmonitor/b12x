@@ -3766,6 +3766,8 @@ def run_w4a16_moe(
     expert_map: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
     fast_math: bool = True,
+    launch_rows: int | None = None,
+    output_rows: int | None = None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     is_gated = validate_activation(activation)
@@ -3788,7 +3790,10 @@ def run_w4a16_moe(
         raise ValueError("a_input, topk_weights, and topk_ids must be contiguous")
     _validate_expert_map(expert_map, device=a_input.device)
 
-    m, hidden_size = a_input.shape
+    input_m, hidden_size = a_input.shape
+    m = input_m if launch_rows is None else int(launch_rows)
+    if m < input_m:
+        raise ValueError(f"launch_rows must be >= input rows {input_m}, got {m}")
     topk = int(topk_ids.shape[1])
     if tuple(topk_weights.shape) != (m, topk):
         raise ValueError(f"topk_weights must have shape {(m, topk)}")
@@ -3796,8 +3801,16 @@ def run_w4a16_moe(
         raise ValueError("prepared hidden_size does not match a_input")
     if bool(prepared.is_gated) != is_gated:
         raise ValueError("prepared weights do not match activation")
-    if tuple(output.shape) != (m, hidden_size):
-        raise ValueError(f"output must have shape {(m, hidden_size)}")
+    output_m = input_m if output_rows is None else int(output_rows)
+    if output_m <= 0 or output_m > input_m:
+        raise ValueError(
+            f"output_rows must be in [1, {input_m}], got {output_m}"
+        )
+    if tuple(output.shape) != (output_m, hidden_size):
+        raise ValueError(
+            f"output must have shape {(output_m, hidden_size)}, "
+            f"got {tuple(output.shape)}"
+        )
     if expert_map is not None and int(expert_map.numel()) < int(prepared.num_experts):
         raise ValueError("expert_map cannot be shorter than the local expert count")
 
@@ -3935,14 +3948,17 @@ def run_w4a16_moe(
         stream,
     )
 
+    # Fused FC1/FC2 may intentionally run on a padded token count to reuse a
+    # compiled M bucket. Only real rows should be reduced into the caller-owned
+    # output buffer; padded rows carry zero route weights and are discarded.
     sum_kernel = compile_w4a16_topk_sum(
-        m=m,
+        m=output_m,
         topk=topk,
         hidden_size=hidden_size,
         element_dtype=element_dtype,
     )
     sum_kernel.compiled(
-        fc2_out.view(-1),
+        fc2_out[: output_m * topk].view(-1),
         output.view(-1),
         stream,
     )

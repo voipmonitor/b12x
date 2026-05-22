@@ -10,7 +10,6 @@ import torch
 from b12x.moe.fused.w4a16.host import (
     W4A16PackedBuffers,
     make_w4a16_packed_buffers as _make_w4a16_packed_buffers,
-    reorder_w13_to_gate_up,
     unswizzle_expert_scales,
     validate_w4a16_packed_inputs,
 )
@@ -89,7 +88,16 @@ def _nvfp4_compute_scale_factor(
         return 1.0
     if packed_scales.numel() == 0:
         return 1.0
-    max_scalar = float(packed_scales.max().item()) * (2**7)
+    if packed_scales.ndim >= 3:
+        max_value = 0.0
+        for expert in range(packed_scales.shape[0]):
+            max_value = max(
+                max_value,
+                float(packed_scales[expert].to(a_dtype).max().item()),
+            )
+    else:
+        max_value = float(packed_scales.to(a_dtype).max().item())
+    max_scalar = max_value * (2**7)
     if max_scalar > 0 and max_scalar < 448 * (2**7):
         return float(2 ** math.floor(math.log2((448 * (2**7)) / max_scalar)))
     return 1.0
@@ -206,13 +214,50 @@ def _repack_4bit_no_perm(
     return result.to(torch.int32).reshape(k_tiles, n_tiles * 128).contiguous()
 
 
-def _repack_weight(weight: torch.Tensor, *, size_k: int, size_n: int) -> torch.Tensor:
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    stride = 1
+    strides: list[int] = []
+    for dim in reversed(shape):
+        strides.append(stride)
+        stride *= int(dim)
+    return tuple(reversed(strides))
+
+
+def _packed_output_tensor(
+    weight: torch.Tensor,
+    out_shape: tuple[int, int, int],
+    *,
+    reuse_weight_storage: bool,
+) -> torch.Tensor:
+    if not reuse_weight_storage:
+        return torch.empty(out_shape, device=weight.device, dtype=torch.int32)
+    if not weight.is_contiguous():
+        raise ValueError("reuse_weight_storage requires contiguous FP4 weight storage")
+    if weight.numel() != math.prod(out_shape) * 4:
+        raise ValueError(
+            "reuse_weight_storage requires packed output to match source storage size"
+        )
+    flat = weight.view(torch.int32).reshape(-1)
+    return torch.as_strided(flat, out_shape, _contiguous_strides(out_shape))
+
+
+def _repack_weight(
+    weight: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+    reuse_weight_storage: bool = False,
+) -> torch.Tensor:
     out_shape = (
         weight.shape[0],
         size_k // _PACKED_TILE_SIZE,
         (size_n // _PACKED_TILE_N_SIZE) * 128,
     )
-    output = torch.empty(out_shape, device=weight.device, dtype=torch.int32)
+    output = _packed_output_tensor(
+        weight,
+        out_shape,
+        reuse_weight_storage=reuse_weight_storage,
+    )
     for expert in range(weight.shape[0]):
         # Keep the temporary contiguous copy expert-local. Materializing the
         # entire expert tensor, then stacking all repacked pieces, creates a
@@ -224,6 +269,47 @@ def _repack_weight(weight: torch.Tensor, *, size_k: int, size_n: int) -> torch.T
     return output
 
 
+def _repack_gated_w13_weight(
+    weight: torch.Tensor,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    reuse_weight_storage: bool = False,
+) -> torch.Tensor:
+    out_shape = (
+        weight.shape[0],
+        hidden_size // _PACKED_TILE_SIZE,
+        ((2 * intermediate_size) // _PACKED_TILE_N_SIZE) * 128,
+    )
+    output = _packed_output_tensor(
+        weight,
+        out_shape,
+        reuse_weight_storage=reuse_weight_storage,
+    )
+    for expert in range(weight.shape[0]):
+        gate_up = torch.cat(
+            [weight[expert, intermediate_size:], weight[expert, :intermediate_size]],
+            dim=0,
+        ).contiguous()
+        qweight = gate_up.view(torch.int32).T.contiguous()
+        output[expert].copy_(
+            _repack_4bit_no_perm(
+                qweight, size_k=hidden_size, size_n=2 * intermediate_size
+            )
+        )
+        del gate_up, qweight
+    return output
+
+
+def _reorder_gated_w13_scales(
+    scales: torch.Tensor, *, intermediate_size: int
+) -> torch.Tensor:
+    output = torch.empty_like(scales)
+    output[:, :intermediate_size].copy_(scales[:, intermediate_size:])
+    output[:, intermediate_size:].copy_(scales[:, :intermediate_size])
+    return output
+
+
 def _permute_nvfp4_scales(
     scales: torch.Tensor,
     global_scales: torch.Tensor,
@@ -232,11 +318,11 @@ def _permute_nvfp4_scales(
     size_n: int,
     a_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    scales = scales.to(a_dtype)
     combined_scale_factor = _nvfp4_compute_scale_factor(scales, a_dtype)
+    expert0 = scales[0].to(a_dtype)
     sample = _process_nvfp4_packed_scales(
         _permute_packed_scales(
-            scales[0].T,
+            expert0.T,
             size_k=size_k,
             size_n=size_n,
             group_size=16,
@@ -247,11 +333,13 @@ def _permute_nvfp4_scales(
         (scales.shape[0], *sample.shape), device=scales.device, dtype=sample.dtype
     )
     packed_scale_rows[0].copy_(sample)
+    del sample, expert0
     for expert in range(scales.shape[0]):
         if expert == 0:
             continue
+        expert_scales = scales[expert].to(a_dtype)
         permuted = _permute_packed_scales(
-            scales[expert].T,
+            expert_scales.T,
             size_k=size_k,
             size_n=size_n,
             group_size=16,
@@ -261,6 +349,7 @@ def _permute_nvfp4_scales(
                 permuted, scale_factor=combined_scale_factor
             )
         )
+        del expert_scales, permuted
     packed_global = _process_nvfp4_packed_global_scale(
         global_scales,
         a_dtype=a_dtype,
@@ -280,6 +369,7 @@ def prepare_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
     source_format: str = "modelopt",
+    reuse_weight_storage: bool = False,
 ) -> W4A16PackedWeights:
     source_format = _normalize_source_format(source_format)
     shape = validate_w4a16_packed_inputs(
@@ -295,28 +385,41 @@ def prepare_w4a16_packed_weights(
     w13_rows = shape.w13_rows
     is_gated = shape.is_gated
 
-    w13 = w13_fp4
+    if is_gated:
+        packed_w13 = _repack_gated_w13_weight(
+            w13_fp4,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            reuse_weight_storage=reuse_weight_storage,
+        )
+    else:
+        packed_w13 = _repack_weight(
+            w13_fp4,
+            size_k=hidden_size,
+            size_n=w13_rows,
+            reuse_weight_storage=reuse_weight_storage,
+        )
+
+    packed_w2 = _repack_weight(
+        w2_fp4,
+        size_k=intermediate_size,
+        size_n=hidden_size,
+        reuse_weight_storage=reuse_weight_storage,
+    )
     w13_scale = unswizzle_expert_scales(
         w13_blockscale,
         rows=w13_rows,
         cols=hidden_size,
     )
     if is_gated:
-        w13, w13_scale = reorder_w13_to_gate_up(
-            w13,
+        w13_scale = _reorder_gated_w13_scales(
             w13_scale,
             intermediate_size=intermediate_size,
         )
-
     w2_scale = unswizzle_expert_scales(
         w2_blockscale,
         rows=hidden_size,
         cols=intermediate_size,
-    )
-
-    packed_w13 = _repack_weight(w13, size_k=hidden_size, size_n=w13_rows)
-    packed_w2 = _repack_weight(
-        w2_fp4, size_k=intermediate_size, size_n=hidden_size
     )
     w13_global_scale = _source_global_scale(
         w13_global_scale,
@@ -333,6 +436,7 @@ def prepare_w4a16_packed_weights(
         size_n=w13_rows,
         a_dtype=params_dtype,
     )
+    del w13_scale
     packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
         w2_scale,
         w2_global_scale,
@@ -340,6 +444,7 @@ def prepare_w4a16_packed_weights(
         size_n=hidden_size,
         a_dtype=params_dtype,
     )
+    del w2_scale
 
     return W4A16PackedWeights(
         w13=packed_w13,

@@ -165,6 +165,8 @@ def _run_cached_host_launcher(
     kernel: object,
     cache_key: tuple[object, ...],
     args: tuple[object, ...],
+    *,
+    compile_args: tuple[object, ...] | None = None,
 ) -> None:
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
@@ -179,12 +181,32 @@ def _run_cached_host_launcher(
                 message="Cache is disabled as user wants to compile only.",
                 category=UserWarning,
             )
-            compiled = kernel(*args, compile_only=True)
+            compiled = kernel(*(compile_args or args), compile_only=True)
         cache[cache_key] = compiled
         if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
             cache.popitem(last=False)
     exe_args, _ = compiled.generate_execution_args(*args)
     compiled.run_compiled_program(exe_args)
+
+
+def _workspace_q_rows_ptr(
+    workspace: object | None,
+    q_rows: int,
+    device: torch.device,
+) -> torch.Tensor:
+    q_rows_ptr = getattr(workspace, "q_rows_ptr", None) if workspace is not None else None
+    if q_rows_ptr is None:
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("B12X MLA q_rows_ptr must be allocated before CUDA graph capture")
+        q_rows_ptr = torch.empty((1,), dtype=torch.int32, device=device)
+        if workspace is not None:
+            setattr(workspace, "q_rows_ptr", q_rows_ptr)
+    if q_rows_ptr.device != device:
+        raise ValueError(f"q_rows_ptr device {q_rows_ptr.device} does not match q device {device}")
+    if q_rows_ptr.dtype != torch.int32 or tuple(q_rows_ptr.shape) != (1,):
+        raise ValueError("q_rows_ptr must have shape (1,) and dtype torch.int32")
+    q_rows_ptr.fill_(int(q_rows))
+    return q_rows_ptr
 
 
 @cute.jit
@@ -2577,6 +2599,7 @@ class SparseMLAKernel:
         page_table_1: cute.Tensor,
         active_token_counts: cute.Tensor,
         sm_scale: cute.Tensor,
+        q_rows_ptr: cute.Tensor,
         output: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -2587,6 +2610,7 @@ class SparseMLAKernel:
             page_table_1,
             active_token_counts,
             sm_scale,
+            q_rows_ptr,
             output,
         ).launch(
             grid=(output.shape[0], self.head_tiles, 1),
@@ -2603,43 +2627,50 @@ class SparseMLAKernel:
         page_table_1: cute.Tensor,
         active_token_counts: cute.Tensor,
         sm_scale: cute.Tensor,
+        q_rows_ptr: cute.Tensor,
         output: cute.Tensor,
     ):
         lane = cute.arch.lane_idx()
         q_idx, head_tile_idx, _ = cute.arch.block_idx()
         q_idx = Int32(q_idx)
-        head_tile_start = Int32(head_tile_idx * _MLA_HEADS_PER_TILE)
-        token_end = _clamp_active_token_count(active_token_counts, q_idx, Int32(page_table_1.shape[1]))
+        if q_idx < Int32(q_rows_ptr[Int32(0)]):
+            head_tile_start = Int32(head_tile_idx * _MLA_HEADS_PER_TILE)
+            token_end = _clamp_active_token_count(
+                active_token_counts, q_idx, Int32(page_table_1.shape[1])
+            )
 
-        smem = cutlass.utils.SmemAllocator()
-        SharedStorage = get_sparse_mla_shared_storage_cls()
-        storage = smem.allocate(SharedStorage)
-        sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-        sScale = storage.token_scale_a.get_tensor(
-            cute.make_layout((_MLA_SCALE_STAGE_ELEMS,), stride=(1,)))
-        q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
-        kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
+            smem = cutlass.utils.SmemAllocator()
+            SharedStorage = get_sparse_mla_shared_storage_cls()
+            storage = smem.allocate(SharedStorage)
+            sTokenIdx = storage.token_idx.get_tensor(
+                cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,))
+            )
+            sScale = storage.token_scale_a.get_tensor(
+                cute.make_layout((_MLA_SCALE_STAGE_ELEMS,), stride=(1,))
+            )
+            q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+            kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
 
-        _run_one_pass_sparse_mla_tile(
-            q_u32,
-            kv_rows_u32,
-            kv_scales,
-            page_table_1,
-            sTokenIdx,
-            sScale,
-            q_base_addr,
-            kv_base_addr,
-            q_idx,
-            head_tile_start,
-            Int32(0),
-            token_end,
-            Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
-            lane,
-            output,
-            q_idx,
-            Int32(0),
-            None,
-        )
+            _run_one_pass_sparse_mla_tile(
+                q_u32,
+                kv_rows_u32,
+                kv_scales,
+                page_table_1,
+                sTokenIdx,
+                sScale,
+                q_base_addr,
+                kv_base_addr,
+                q_idx,
+                head_tile_start,
+                Int32(0),
+                token_end,
+                Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+                lane,
+                output,
+                q_idx,
+                Int32(0),
+                None,
+            )
 
 @lru_cache(maxsize=16)
 def _build_sparse_mla_kernel_for_shape(
@@ -2716,6 +2747,7 @@ def run_sparse_mla_kernel(
 
     kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(kv_cache)
     q_u32 = _view_last_dim_as_u32(q_all)
+    q_rows_ptr = _workspace_q_rows_ptr(workspace, int(q_all.shape[0]), q_all.device)
     if isinstance(sm_scale, torch.Tensor):
         sm_scale_tensor = sm_scale
     else:
@@ -2734,22 +2766,18 @@ def run_sparse_mla_kernel(
         _to_kernel_tensor(page_table_1, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(active_token_counts, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(sm_scale_tensor, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(q_rows_ptr, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
         current_cuda_stream(),
     )
-    # Use phantom tensors from workspace for stable cache keys when available.
-    _cq = getattr(workspace, "_contract_q", None)
-    _ckv, _cks = _workspace_contract_kv_tensors(workspace, kv_cache)
-    _cpt = getattr(workspace, "_contract_page_table", None)
-    _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
-    _co = getattr(workspace, "_contract_output", None)
     cache_key = (
-        _tensor_meta_key(_cq if _cq is not None else q_u32),
-        _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
-        _tensor_meta_key(_cks if _cks is not None else kv_scales),
-        _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
-        _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
-        _tensor_meta_key(_co if _co is not None else output),
+        _tensor_meta_key(q_u32),
+        _tensor_meta_key(kv_rows_u32),
+        _tensor_meta_key(kv_scales),
+        _tensor_meta_key(page_table_1),
+        _tensor_meta_key(active_token_counts),
+        _tensor_meta_key(q_rows_ptr),
+        _tensor_meta_key(output),
         traits,
         head_tiles,
         str(output.dtype),

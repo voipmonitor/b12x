@@ -38,7 +38,7 @@ from .kernel import (
     _to_kernel_tensor,
     _torch_to_cutlass_dtype,
     _view_last_dim_as_u32,
-    _workspace_contract_kv_tensors,
+    _workspace_q_rows_ptr,
     get_sparse_mla_shared_storage_cls,
 )
 from .traits import SparseMLATraits, select_sparse_mla_traits
@@ -231,6 +231,7 @@ class SparseMLASplitDecodeForwardKernel:
         sm_scale: cute.Tensor,
         kv_chunk_size_ptr: cute.Tensor,
         num_chunks_ptr: cute.Tensor,
+        q_rows_ptr: cute.Tensor,
         tmp_output: cute.Tensor,
         tmp_lse: cute.Tensor,
         stream: cuda.CUstream,
@@ -244,6 +245,7 @@ class SparseMLASplitDecodeForwardKernel:
             sm_scale,
             kv_chunk_size_ptr,
             num_chunks_ptr,
+            q_rows_ptr,
             tmp_output,
             tmp_lse,
         ).launch(
@@ -267,61 +269,65 @@ class SparseMLASplitDecodeForwardKernel:
         sm_scale: cute.Tensor,
         kv_chunk_size_ptr: cute.Tensor,
         num_chunks_ptr: cute.Tensor,
+        q_rows_ptr: cute.Tensor,
         tmp_output: cute.Tensor,
         tmp_lse: cute.Tensor,
     ):
         lane = cute.arch.lane_idx()
         q_idx, head_tile_idx, chunk_idx = cute.arch.block_idx()
         q_idx = Int32(q_idx)
-        head_tile_start = Int32(head_tile_idx * _MLA_HEADS_PER_TILE)
-        chunk_idx = Int32(chunk_idx)
+        if q_idx < Int32(q_rows_ptr[Int32(0)]):
+            head_tile_start = Int32(head_tile_idx * _MLA_HEADS_PER_TILE)
+            chunk_idx = Int32(chunk_idx)
 
-        active_num_chunks = Int32(num_chunks_ptr[Int32(0)])
-        if active_num_chunks > Int32(_SPLIT_MAX_CHUNKS):
-            active_num_chunks = Int32(_SPLIT_MAX_CHUNKS)
-        row_token_end = _clamp_active_token_count(
-            active_token_counts, q_idx, Int32(page_table_1.shape[1])
-        )
-        chunk_size = Int32(kv_chunk_size_ptr[Int32(0)])
-        token_start = Int32(chunk_idx) * chunk_size
-        if chunk_idx >= active_num_chunks or token_start >= row_token_end:
-            _zero_partial_head_tile(tmp_output, tmp_lse, q_idx, chunk_idx, head_tile_start, lane)
-        else:
-            token_end = token_start + chunk_size
-            if token_end > row_token_end:
-                token_end = row_token_end
-
-            smem = cutlass.utils.SmemAllocator()
-            SharedStorage = get_sparse_mla_split_shared_storage_cls()
-            storage = smem.allocate(SharedStorage)
-            sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
-            sScale = storage.token_scale_a.get_tensor(
-                cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
+            active_num_chunks = Int32(num_chunks_ptr[Int32(0)])
+            if active_num_chunks > Int32(_SPLIT_MAX_CHUNKS):
+                active_num_chunks = Int32(_SPLIT_MAX_CHUNKS)
+            row_token_end = _clamp_active_token_count(
+                active_token_counts, q_idx, Int32(page_table_1.shape[1])
             )
+            chunk_size = Int32(kv_chunk_size_ptr[Int32(0)])
+            token_start = Int32(chunk_idx) * chunk_size
+            if chunk_idx >= active_num_chunks or token_start >= row_token_end:
+                _zero_partial_head_tile(tmp_output, tmp_lse, q_idx, chunk_idx, head_tile_start, lane)
+            else:
+                token_end = token_start + chunk_size
+                if token_end > row_token_end:
+                    token_end = row_token_end
 
-            q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
-            kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
+                smem = cutlass.utils.SmemAllocator()
+                SharedStorage = get_sparse_mla_split_shared_storage_cls()
+                storage = smem.allocate(SharedStorage)
+                sTokenIdx = storage.token_idx.get_tensor(
+                    cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,))
+                )
+                sScale = storage.token_scale_a.get_tensor(
+                    cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
+                )
 
-            _run_one_pass_sparse_mla_tile(
-                q_u32,
-                kv_rows_u32,
-                kv_scales,
-                page_table_1,
-                sTokenIdx,
-                sScale,
-                q_base_addr,
-                kv_base_addr,
-                q_idx,
-                head_tile_start,
-                token_start,
-                token_end,
-                Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
-                lane,
-                tmp_output,
-                q_idx,
-                chunk_idx,
-                tmp_lse,
-            )
+                q_base_addr = shared_ptr_to_u32(storage.q_group_stage.data_ptr())
+                kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
+
+                _run_one_pass_sparse_mla_tile(
+                    q_u32,
+                    kv_rows_u32,
+                    kv_scales,
+                    page_table_1,
+                    sTokenIdx,
+                    sScale,
+                    q_base_addr,
+                    kv_base_addr,
+                    q_idx,
+                    head_tile_start,
+                    token_start,
+                    token_end,
+                    Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
+                    lane,
+                    tmp_output,
+                    q_idx,
+                    chunk_idx,
+                    tmp_lse,
+                )
 
 
 class SparseMLASplitDecodeMergeKernel:
@@ -333,6 +339,7 @@ class SparseMLASplitDecodeMergeKernel:
         tmp_output: cute.Tensor,
         tmp_lse: cute.Tensor,
         num_chunks_ptr: cute.Tensor,
+        q_rows_ptr: cute.Tensor,
         output: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -340,6 +347,7 @@ class SparseMLASplitDecodeMergeKernel:
             tmp_output,
             tmp_lse,
             num_chunks_ptr,
+            q_rows_ptr,
             output,
         ).launch(
             grid=(output.shape[0], output.shape[1], _MLA_SCALE_GROUPS),
@@ -353,72 +361,94 @@ class SparseMLASplitDecodeMergeKernel:
         tmp_output: cute.Tensor,
         tmp_lse: cute.Tensor,
         num_chunks_ptr: cute.Tensor,
+        q_rows_ptr: cute.Tensor,
         output: cute.Tensor,
     ):
         lane = cute.arch.lane_idx()
         q_idx, head_idx, group_idx = cute.arch.block_idx()
         q_idx = Int32(q_idx)
-        head_idx = Int32(head_idx)
-        group_idx = Int32(group_idx)
+        if q_idx < Int32(q_rows_ptr[Int32(0)]):
+            head_idx = Int32(head_idx)
+            group_idx = Int32(group_idx)
 
-        acc = cute.make_rmem_tensor((4,), Float32)
-        for frag_idx in cutlass.range_constexpr(4):
-            acc[frag_idx] = Float32(0.0)
+            acc = cute.make_rmem_tensor((4,), Float32)
+            for frag_idx in cutlass.range_constexpr(4):
+                acc[frag_idx] = Float32(0.0)
 
-        out_base = group_idx * Int32(_MLA_GROUP_SIZE) + lane * Int32(4)
-        tmp_output_lane = _split_output_lane_view(tmp_output, q_idx, head_idx, out_base)
-        tmp_lse_head = _split_lse_head_view(tmp_lse, q_idx, head_idx)
-        merged_m = Float32(-Float32.inf)
-        merged_d = Float32(1.0)
-        chunk_idx = Int32(0)
-        num_chunks = Int32(num_chunks_ptr[Int32(0)])
-        if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
-            num_chunks = Int32(_SPLIT_MAX_CHUNKS)
+            out_base = group_idx * Int32(_MLA_GROUP_SIZE) + lane * Int32(4)
+            tmp_output_lane = _split_output_lane_view(tmp_output, q_idx, head_idx, out_base)
+            tmp_lse_head = _split_lse_head_view(tmp_lse, q_idx, head_idx)
+            merged_m = Float32(-Float32.inf)
+            merged_d = Float32(1.0)
+            chunk_idx = Int32(0)
+            num_chunks = Int32(num_chunks_ptr[Int32(0)])
+            if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
+                num_chunks = Int32(_SPLIT_MAX_CHUNKS)
 
-        while chunk_idx < num_chunks and merged_m == Float32(-Float32.inf):
-            part_lse = Float32(tmp_lse_head[chunk_idx])
-            if part_lse != Float32(-Float32.inf):
-                acc[0] = Float32(tmp_output_lane[chunk_idx, Int32(0)])
-                acc[1] = Float32(tmp_output_lane[chunk_idx, Int32(1)])
-                acc[2] = Float32(tmp_output_lane[chunk_idx, Int32(2)])
-                acc[3] = Float32(tmp_output_lane[chunk_idx, Int32(3)])
-                merged_m = Float32(part_lse)
-                merged_d = Float32(1.0)
-            chunk_idx += Int32(1)
+            while chunk_idx < num_chunks and merged_m == Float32(-Float32.inf):
+                part_lse = Float32(tmp_lse_head[chunk_idx])
+                if part_lse != Float32(-Float32.inf):
+                    acc[0] = Float32(tmp_output_lane[chunk_idx, Int32(0)])
+                    acc[1] = Float32(tmp_output_lane[chunk_idx, Int32(1)])
+                    acc[2] = Float32(tmp_output_lane[chunk_idx, Int32(2)])
+                    acc[3] = Float32(tmp_output_lane[chunk_idx, Int32(3)])
+                    merged_m = Float32(part_lse)
+                    merged_d = Float32(1.0)
+                chunk_idx += Int32(1)
 
-        while chunk_idx < num_chunks:
-            part_lse = Float32(tmp_lse_head[chunk_idx])
-            if part_lse != Float32(-Float32.inf):
-                new_m = attention_utils.fmax(merged_m, part_lse)
-                prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
-                part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
-                merged_d = Float32(merged_d * prev_scale + part_scale)
-                acc[0] = Float32(
-                    acc[0] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(0)]) * part_scale
+            while chunk_idx < num_chunks:
+                part_lse = Float32(tmp_lse_head[chunk_idx])
+                if part_lse != Float32(-Float32.inf):
+                    new_m = attention_utils.fmax(merged_m, part_lse)
+                    prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
+                    part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
+                    merged_d = Float32(merged_d * prev_scale + part_scale)
+                    acc[0] = Float32(
+                        acc[0] * prev_scale
+                        + Float32(tmp_output_lane[chunk_idx, Int32(0)]) * part_scale
+                    )
+                    acc[1] = Float32(
+                        acc[1] * prev_scale
+                        + Float32(tmp_output_lane[chunk_idx, Int32(1)]) * part_scale
+                    )
+                    acc[2] = Float32(
+                        acc[2] * prev_scale
+                        + Float32(tmp_output_lane[chunk_idx, Int32(2)]) * part_scale
+                    )
+                    acc[3] = Float32(
+                        acc[3] * prev_scale
+                        + Float32(tmp_output_lane[chunk_idx, Int32(3)]) * part_scale
+                    )
+                    merged_m = Float32(new_m)
+                chunk_idx += Int32(1)
+
+            if merged_m == Float32(-Float32.inf):
+                output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(
+                    output.element_type
                 )
-                acc[1] = Float32(
-                    acc[1] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(1)]) * part_scale
+                output[q_idx, head_idx, out_base + Int32(1)] = Float32(0.0).to(
+                    output.element_type
                 )
-                acc[2] = Float32(
-                    acc[2] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(2)]) * part_scale
+                output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(
+                    output.element_type
                 )
-                acc[3] = Float32(
-                    acc[3] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(3)]) * part_scale
+                output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(
+                    output.element_type
                 )
-                merged_m = Float32(new_m)
-            chunk_idx += Int32(1)
-
-        if merged_m == Float32(-Float32.inf):
-            output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(1)] = Float32(0.0).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(output.element_type)
-        else:
-            inv_d = cute.arch.rcp_approx(merged_d)
-            output[q_idx, head_idx, out_base + Int32(0)] = Float32(acc[0] * inv_d).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(1)] = Float32(acc[1] * inv_d).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(2)] = Float32(acc[2] * inv_d).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(3)] = Float32(acc[3] * inv_d).to(output.element_type)
+            else:
+                inv_d = cute.arch.rcp_approx(merged_d)
+                output[q_idx, head_idx, out_base + Int32(0)] = Float32(acc[0] * inv_d).to(
+                    output.element_type
+                )
+                output[q_idx, head_idx, out_base + Int32(1)] = Float32(acc[1] * inv_d).to(
+                    output.element_type
+                )
+                output[q_idx, head_idx, out_base + Int32(2)] = Float32(acc[2] * inv_d).to(
+                    output.element_type
+                )
+                output[q_idx, head_idx, out_base + Int32(3)] = Float32(acc[3] * inv_d).to(
+                    output.element_type
+                )
 
 
 @lru_cache(maxsize=16)
@@ -454,6 +484,7 @@ def run_sparse_mla_split_decode_forward(
     tmp_lse: torch.Tensor,
     launch_num_chunks: int,
     workspace: object | None = None,
+    q_rows_ptr: torch.Tensor | None = None,
 ) -> None:
     traits = select_sparse_mla_traits(
         q_all=q_all,
@@ -483,6 +514,8 @@ def run_sparse_mla_split_decode_forward(
 
     kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(kv_cache)
     q_u32 = _view_last_dim_as_u32(q_all)
+    if q_rows_ptr is None:
+        q_rows_ptr = _workspace_q_rows_ptr(workspace, int(q_all.shape[0]), q_all.device)
     if sm_scale.shape != (1,) or sm_scale.dtype != torch.float32:
         raise ValueError("sm_scale tensor must have shape (1,) and dtype float32")
 
@@ -500,26 +533,22 @@ def run_sparse_mla_split_decode_forward(
         _to_kernel_tensor(sm_scale, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(kv_chunk_size_ptr, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(q_rows_ptr, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
         _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
         current_cuda_stream(),
     )
-    _cq = getattr(workspace, "_contract_q", None)
-    _ckv, _cks = _workspace_contract_kv_tensors(workspace, kv_cache)
-    _cpt = getattr(workspace, "_contract_page_table", None)
-    _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
-    _cto = getattr(workspace, "_contract_tmp_output", None)
-    _ctl = getattr(workspace, "_contract_tmp_lse", None)
     forward_cache_key = (
-        _tensor_meta_key(_cq if _cq is not None else q_u32),
-        _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
-        _tensor_meta_key(_cks if _cks is not None else kv_scales),
-        _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
-        _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
+        _tensor_meta_key(q_u32),
+        _tensor_meta_key(kv_rows_u32),
+        _tensor_meta_key(kv_scales),
+        _tensor_meta_key(page_table_1),
+        _tensor_meta_key(active_token_counts),
         _tensor_meta_key(kv_chunk_size_ptr),
         _tensor_meta_key(num_chunks_ptr),
-        _tensor_meta_key(_cto if _cto is not None else tmp_output),
-        _tensor_meta_key(_ctl if _ctl is not None else tmp_lse),
+        _tensor_meta_key(q_rows_ptr),
+        _tensor_meta_key(tmp_output),
+        _tensor_meta_key(tmp_lse),
         traits,
         int(launch_num_chunks),
         head_tiles,
@@ -535,23 +564,25 @@ def run_sparse_mla_split_decode_merge(
     num_chunks_ptr: torch.Tensor,
     output: torch.Tensor,
     workspace: object | None = None,
+    q_rows_ptr: torch.Tensor | None = None,
 ) -> None:
     merge_kernel = _build_sparse_mla_split_merge_kernel()
+    if q_rows_ptr is None:
+        q_rows_ptr = _workspace_q_rows_ptr(workspace, int(output.shape[0]), output.device)
     merge_args = (
         _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
         _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(q_rows_ptr, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
         current_cuda_stream(),
     )
-    _cto = getattr(workspace, "_contract_tmp_output", None)
-    _ctl = getattr(workspace, "_contract_tmp_lse", None)
-    _co = getattr(workspace, "_contract_output", None)
     merge_cache_key = (
-        _tensor_meta_key(_cto if _cto is not None else tmp_output),
-        _tensor_meta_key(_ctl if _ctl is not None else tmp_lse),
+        _tensor_meta_key(tmp_output),
+        _tensor_meta_key(tmp_lse),
         _tensor_meta_key(num_chunks_ptr),
-        _tensor_meta_key(_co if _co is not None else output),
+        _tensor_meta_key(q_rows_ptr),
+        _tensor_meta_key(output),
         str(tmp_output.dtype),
         str(output.dtype),
     )
@@ -573,6 +604,7 @@ def run_sparse_mla_split_decode(
     launch_num_chunks: int,
     workspace: object | None = None,
 ) -> None:
+    q_rows_ptr = _workspace_q_rows_ptr(workspace, int(q_all.shape[0]), q_all.device)
     run_sparse_mla_split_decode_forward(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -581,6 +613,7 @@ def run_sparse_mla_split_decode(
         sm_scale=sm_scale,
         kv_chunk_size_ptr=kv_chunk_size_ptr,
         num_chunks_ptr=num_chunks_ptr,
+        q_rows_ptr=q_rows_ptr,
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         launch_num_chunks=launch_num_chunks,
@@ -590,6 +623,7 @@ def run_sparse_mla_split_decode(
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         num_chunks_ptr=num_chunks_ptr,
+        q_rows_ptr=q_rows_ptr,
         output=output,
         workspace=workspace,
     )
