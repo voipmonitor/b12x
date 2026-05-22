@@ -1573,7 +1573,12 @@ def run_sparse_nsa_paged_logits_kernel(
         else:
             logits = torch.empty((rows, width_tokens), dtype=torch.float32, device=q_fp8.device)
         logits_view = logits
-    _cp = contract_phantoms or {}
+    # The paged decode kernels launch their grid from q_bytes.shape[0] and do
+    # not take a runtime "active q rows" guard. Therefore q rows are part of the
+    # actual launch contract. Do not hide that dimension behind phantoms: a
+    # launcher first compiled for q_rows=1 can otherwise be reused for MTP
+    # verify q_rows=4 under the same cache key, leaving rows uncomputed/stale
+    # before the sparse MLA verifier consumes the top-k metadata.
     common_args = (
         _to_kernel_tensor(q_bytes, cutlass.Uint8),
         _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
@@ -1586,16 +1591,16 @@ def run_sparse_nsa_paged_logits_kernel(
     )
     common_cache_key = (
         q_fp8.shape[1],
-        _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
-        _tensor_meta_key(_cp.get("weights", weights_kernel)),
+        _tensor_meta_key(q_bytes),
+        _tensor_meta_key(weights_kernel),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
         _tensor_meta_key(use_patched_k_tma_desc_tensor),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(_cp.get("real_page_table", real_page_table_kernel)),
-        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query_kernel)),
+        _tensor_meta_key(real_page_table_kernel),
+        _tensor_meta_key(seqlens_per_query_kernel),
         _tensor_meta_key(active_width_kernel),
-        _tensor_meta_key(_cp.get("logits", logits)),
+        _tensor_meta_key(logits),
     )
     max_pages = int(real_page_table.shape[1])
     if schedule_metadata is not None and schedule_metadata_kernel is None:

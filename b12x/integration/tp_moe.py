@@ -476,6 +476,7 @@ def _dynamic_tile_m(quant_mode: str = "nvfp4") -> int:
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _W4A16_PACKED_WEIGHT_CACHE: Dict[Tuple[object, ...], object] = {}
+_W4A16_PACKED_WEIGHT_OBJECT_CACHE: Dict[Tuple[object, ...], object] = {}
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
@@ -540,6 +541,7 @@ def clear_tp_moe_caches() -> None:
     global _DYNAMIC_DOWN_SCALE_CACHE
     _WEIGHT_CACHE.clear()
     _W4A16_PACKED_WEIGHT_CACHE.clear()
+    _W4A16_PACKED_WEIGHT_OBJECT_CACHE.clear()
     clear_w4a16_kernel_cache()
     _MICRO_KERNEL_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
@@ -1553,10 +1555,25 @@ def _get_w4a16_packed_weights(
     activation: str,
     params_dtype: torch.dtype,
     source_format: str = "modelopt",
+    reuse_weight_storage: bool = False,
 ):
     from b12x.moe.fused.w4a16.prepare import prepare_w4a16_packed_weights
 
     source_format = _normalize_fp4_source_format(source_format)
+    object_key = (
+        id(w1_fp4),
+        id(w1_blockscale),
+        id(w1_alphas),
+        id(w2_fp4),
+        id(w2_blockscale),
+        id(w2_alphas),
+        activation,
+        params_dtype,
+        source_format,
+    )
+    cached = _W4A16_PACKED_WEIGHT_OBJECT_CACHE.get(object_key)
+    if cached is not None:
+        return cached
     key = (
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
@@ -1570,6 +1587,7 @@ def _get_w4a16_packed_weights(
     )
     cached = _W4A16_PACKED_WEIGHT_CACHE.get(key)
     if cached is not None:
+        _W4A16_PACKED_WEIGHT_OBJECT_CACHE[object_key] = cached
         return cached
     prepared = prepare_w4a16_packed_weights(
         w1_fp4,
@@ -1581,9 +1599,48 @@ def _get_w4a16_packed_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format=source_format,
+        reuse_weight_storage=reuse_weight_storage,
     )
     _W4A16_PACKED_WEIGHT_CACHE[key] = prepared
+    _W4A16_PACKED_WEIGHT_OBJECT_CACHE[object_key] = prepared
     return prepared
+
+
+def preload_w4a16_packed_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype,
+    quant_mode: str | None = None,
+    source_format: str = "modelopt",
+):
+    """Populate the W4A16 packed-weight cache without launching MoE kernels."""
+    quant_mode_arg = quant_mode
+    if _normalize_quant_mode(quant_mode_arg) != "w4a16":
+        return None
+    weight_E = w1_fp4.shape[0]
+    if quant_mode_arg is None:
+        w1_alphas = _w4a16_default_alpha(w1_alphas, a1_gscale, weight_E)
+        w2_alphas = _w4a16_default_alpha(w2_alphas, a2_gscale, weight_E)
+    return _get_w4a16_packed_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        activation=activation,
+        params_dtype=params_dtype,
+        source_format=source_format,
+        reuse_weight_storage=True,
+    )
 
 
 def _resolve_workspace_layout(
@@ -3579,6 +3636,8 @@ def b12x_moe_fp4(
     fast_math: bool | None = None,
     activation: str = "silu",
     quant_mode: str | None = None,
+    launch_rows: int | None = None,
+    output_rows: int | None = None,
     unit_scale_contract: bool = False,
     source_format: str = "modelopt",
 ) -> torch.Tensor:
@@ -3597,6 +3656,7 @@ def b12x_moe_fp4(
         quant_mode=quant_mode,
     )
     m, k = a.shape
+    input_m = m
     E = w1_fp4.shape[0]
     weight_E = E
     n = w2_fp4.shape[2] * 2  # intermediate_size
@@ -3634,17 +3694,32 @@ def b12x_moe_fp4(
     if quant_mode == "w4a16":
         from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
 
+        launch_m = input_m if launch_rows is None else int(launch_rows)
+        if launch_m < input_m:
+            raise ValueError(
+                f"launch_rows must be >= input rows {input_m}, got {launch_m}"
+            )
+        if int(topk_ids.shape[0]) != launch_m or int(topk_weights.shape[0]) != launch_m:
+            raise ValueError(
+                f"W4A16 topk tensors must have {launch_m} rows for launch_rows"
+            )
         if output is None:
             if torch.cuda.is_current_stream_capturing():
                 raise ValueError(
                     "CUDA graph capture requires a caller-owned output buffer"
                 )
-            scatter_output = torch.empty(m, k, dtype=a.dtype, device=device)
+            scatter_output = torch.empty(input_m, k, dtype=a.dtype, device=device)
         else:
             scatter_output = output
-        if scatter_output.shape != (m, k):
+        scatter_rows = input_m if output_rows is None else int(output_rows)
+        if scatter_rows <= 0 or scatter_rows > input_m:
             raise ValueError(
-                f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}"
+                f"output_rows must be in [1, {input_m}], got {scatter_rows}"
+            )
+        if scatter_output.shape != (scatter_rows, k):
+            raise ValueError(
+                f"output must have shape {(scatter_rows, k)}, "
+                f"got {tuple(scatter_output.shape)}"
             )
         if scatter_output.dtype != a.dtype:
             raise ValueError(
@@ -3669,7 +3744,7 @@ def b12x_moe_fp4(
             source_format=source_format,
         )
         plan = _make_workspace_plan(
-            num_tokens=m,
+            num_tokens=launch_m,
             weight_E=weight_E,
             k=k,
             n=n,
@@ -3708,6 +3783,7 @@ def b12x_moe_fp4(
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             fast_math=fast_math,
+            launch_rows=launch_m,
             intermediate_cache13=w4a16_workspace.intermediate_cache13,
             intermediate_cache2=w4a16_workspace.intermediate_cache2,
             output=scatter_output,
@@ -3717,6 +3793,7 @@ def b12x_moe_fp4(
             block_expert_ids=w4a16_workspace.block_expert_ids,
             packed_route_count=w4a16_workspace.packed_route_count,
             expert_offsets=w4a16_workspace.expert_offsets,
+            output_rows=scatter_rows,
         )
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     if quant_mode == "nvfp4" and _is_exact_relu2_bs1_nemotron_case(

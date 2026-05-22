@@ -258,6 +258,8 @@ class _B12XAttentionArenaLayout:
     ragged_kv_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
+    final_lse_offset_bytes: int
+    output_offset_bytes: int
     indexer_k_quant_offset_bytes: int
     indexer_k_scale_offset_bytes: int
     indexer_extend_logits_offset_bytes: int
@@ -296,6 +298,8 @@ class B12XAttentionArena:
     ragged_kv_offset_bytes: int
     tmp_output_offset_bytes: int
     tmp_lse_offset_bytes: int
+    final_lse_offset_bytes: int
+    output_offset_bytes: int
     indexer_k_quant_offset_bytes: int
     indexer_k_scale_offset_bytes: int
     indexer_extend_logits_offset_bytes: int
@@ -341,6 +345,21 @@ class B12XAttentionArena:
             * int(caps.num_q_heads)
             * int(caps.max_chunks_per_row)
             * _dtype_nbytes(torch.float32)
+        )
+        mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+        final_lse_offset_bytes = mla_offset
+        mla_offset += (
+            max_total_q
+            * int(caps.num_q_heads)
+            * _dtype_nbytes(torch.float32)
+        )
+        mla_offset = _align_up(mla_offset, _ARENA_ALIGN_BYTES)
+        output_offset_bytes = mla_offset
+        mla_offset += (
+            max_total_q
+            * int(caps.num_q_heads)
+            * int(caps.max_v_head_dim)
+            * _dtype_nbytes(caps.dtype)
         )
         mla_phase_nbytes = int(mla_offset)
 
@@ -491,6 +510,8 @@ class B12XAttentionArena:
             ragged_kv_offset_bytes=ragged_kv_offset_bytes,
             tmp_output_offset_bytes=tmp_output_offset_bytes,
             tmp_lse_offset_bytes=tmp_lse_offset_bytes,
+            final_lse_offset_bytes=final_lse_offset_bytes,
+            output_offset_bytes=output_offset_bytes,
             indexer_k_quant_offset_bytes=indexer_k_quant_offset_bytes,
             indexer_k_scale_offset_bytes=indexer_k_scale_offset_bytes,
             indexer_extend_logits_offset_bytes=indexer_extend_logits_offset_bytes,
@@ -551,6 +572,8 @@ class B12XAttentionArena:
             ragged_kv_offset_bytes=layout.ragged_kv_offset_bytes,
             tmp_output_offset_bytes=layout.tmp_output_offset_bytes,
             tmp_lse_offset_bytes=layout.tmp_lse_offset_bytes,
+            final_lse_offset_bytes=layout.final_lse_offset_bytes,
+            output_offset_bytes=layout.output_offset_bytes,
             indexer_k_quant_offset_bytes=layout.indexer_k_quant_offset_bytes,
             indexer_k_scale_offset_bytes=layout.indexer_k_scale_offset_bytes,
             indexer_extend_logits_offset_bytes=layout.indexer_extend_logits_offset_bytes,
@@ -702,9 +725,12 @@ class B12XAttentionWorkspace:
     paged_indexer_schedule_metadata_runtime: torch.Tensor | None = None
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
+    final_lse: torch.Tensor | None = None
+    output_buffer: torch.Tensor | None = None
     ragged_kv_cache: torch.Tensor | None = None
     kv_chunk_size_ptr: torch.Tensor | None = None
     num_chunks_ptr: torch.Tensor | None = None
+    q_rows_ptr: torch.Tensor | None = None
     sm_scale_tensor: torch.Tensor | None = None
     sm_scale_value: float | None = None
     kv_chunk_size_value: int | None = None
@@ -803,6 +829,17 @@ class B12XAttentionWorkspace:
             * int(self.num_q_heads)
             * int(self.max_chunks_per_row)
             * _dtype_nbytes(torch.float32)
+            + int(self.max_total_q)
+            * int(self.num_q_heads)
+            * _dtype_nbytes(torch.float32)
+            + (
+                int(self.max_total_q)
+                * int(self.num_q_heads)
+                * int(self.v_head_dim)
+                * _dtype_nbytes(self.dtype)
+                if self.use_cuda_graph
+                else 0
+            )
             + 2 * _dtype_nbytes(torch.int32)
         )
 
@@ -1004,6 +1041,18 @@ class B12XAttentionWorkspace:
             shape=(max_total_q, int(self.num_q_heads), int(self.max_chunks_per_row)),
             dtype=torch.float32,
         )
+        self.final_lse, _ = _materialize_arena_view(
+            self.shared_arena,
+            offset_bytes=self.arena.final_lse_offset_bytes,
+            shape=(max_total_q, int(self.num_q_heads)),
+            dtype=torch.float32,
+        )
+        self.output_buffer, _ = _materialize_arena_view(
+            self.shared_arena,
+            offset_bytes=self.arena.output_offset_bytes,
+            shape=(max_total_q, int(self.num_q_heads), int(self.v_head_dim)),
+            dtype=self.dtype,
+        )
 
         self.indexer_k_quant_bytes, extend_offset = _materialize_arena_view(
             self.shared_arena,
@@ -1145,9 +1194,21 @@ class B12XAttentionWorkspace:
                 dtype=self.dtype,
                 device=self.device,
             )
+        if self.use_cuda_graph and self.output_buffer is None:
+            self.output_buffer = torch.empty(
+                (self.max_total_q, self.num_q_heads, self.v_head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
         if self.tmp_lse is None:
             self.tmp_lse = torch.empty(
                 (self.max_total_q, self.num_q_heads, self.max_chunks_per_row),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if self.final_lse is None:
+            self.final_lse = torch.empty(
+                (self.max_total_q, self.num_q_heads),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -1157,6 +1218,8 @@ class B12XAttentionWorkspace:
         if self.num_chunks_ptr is None:
             self.num_chunks_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
             self.num_chunks_value = None
+        if self.q_rows_ptr is None:
+            self.q_rows_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
 
     def _initialize_split_chunk_config_if_needed(self) -> None:
         self._allocate_split_buffers()
@@ -1164,8 +1227,14 @@ class B12XAttentionWorkspace:
             return
         if self.kv_chunk_size_value is not None and self.num_chunks_value is not None:
             return
+        # Arena capacity may be wider than the live split-decode page table
+        # (for example decode workspaces reserve full model-page width while
+        # sparse MLA split supports the top-k width). Initialize the runtime
+        # chunk pointers to the largest supported live width so graph capture
+        # never sees uninitialized split config scalars.
+        split_width = min(int(self.topk), 2048)
         split_cfg = default_sparse_mla_split_decode_config_for_width(
-            int(self.topk),
+            split_width,
             max_chunks=self.max_chunks_per_row,
         )
         if split_cfg is None:

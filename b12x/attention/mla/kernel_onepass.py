@@ -2262,19 +2262,13 @@ def run_sparse_mla_kernel(
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
         current_cuda_stream(),
     )
-    # Use phantom tensors from workspace for stable cache keys when available.
-    _cq = getattr(workspace, "_contract_q", None)
-    _ckv, _cks = _workspace_contract_kv_tensors(workspace, kv_cache)
-    _cpt = getattr(workspace, "_contract_page_table", None)
-    _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
-    _co = getattr(workspace, "_contract_output", None)
     cache_key = (
-        _tensor_meta_key(_cq if _cq is not None else q_u32),
-        _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
-        _tensor_meta_key(_cks if _cks is not None else kv_scales),
-        _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
-        _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
-        _tensor_meta_key(_co if _co is not None else output),
+        _tensor_meta_key(q_u32),
+        _tensor_meta_key(kv_rows_u32),
+        _tensor_meta_key(kv_scales),
+        _tensor_meta_key(page_table_1),
+        _tensor_meta_key(active_token_counts),
+        _tensor_meta_key(output),
         traits,
         head_tiles,
         str(output.dtype),

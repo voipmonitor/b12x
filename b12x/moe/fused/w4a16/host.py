@@ -117,11 +117,18 @@ def unswizzle_expert_scales(
 ) -> torch.Tensor:
     if swizzled.dtype != torch.float8_e4m3fn:
         swizzled = swizzled.view(torch.float8_e4m3fn)
-    scales = [
-        unswizzle_block_scale(swizzled[e], rows, cols // 16).to(torch.float8_e4m3fn)
-        for e in range(swizzled.shape[0])
-    ]
-    return torch.stack(scales, dim=0).contiguous()
+    output = torch.empty(
+        (swizzled.shape[0], rows, cols // 16),
+        device=swizzled.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    for expert in range(swizzled.shape[0]):
+        output[expert].copy_(
+            unswizzle_block_scale(swizzled[expert], rows, cols // 16).to(
+                torch.float8_e4m3fn
+            )
+        )
+    return output.contiguous()
 
 
 def reorder_w13_to_gate_up(
