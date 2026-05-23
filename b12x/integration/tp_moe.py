@@ -1419,6 +1419,14 @@ def _allocate_core_arena(plan: _TPCoreWorkspacePlan) -> _TPCoreArena:
     return arena
 
 
+def _requires_standalone_core_arena(plan: _TPCoreWorkspacePlan) -> bool:
+    # Direct W4A16 micro uses resident-grid launch state and intermediate scratch
+    # across one fused FC1/FC2 kernel. Keep that scratch out of the shared
+    # attention/MoE overlay arena; normal W4A16 workspace launches still use the
+    # caller-owned shared arena.
+    return plan.implementation == "static" and plan.quant_mode == "w4a16"
+
+
 def _materialize_workspace_from_core_arena(
     plan: _TPCoreWorkspacePlan,
     arena: _TPCoreArena,
@@ -1573,7 +1581,7 @@ def _alloc_workspace(
             )
         arena = pool.core_arenas.get(storage_key)
         if arena is None or arena.plan != plan:
-            if pool.shared_arena is None:
+            if pool.shared_arena is None or _requires_standalone_core_arena(plan):
                 arena = _allocate_core_arena(plan)
             else:
                 if pool.shared_arena.device != plan.device:
@@ -2906,7 +2914,7 @@ def materialize_tp_moe_arena_workspaces(
                 else:
                     continue
 
-        if pool.shared_arena is None:
+        if pool.shared_arena is None or _requires_standalone_core_arena(core_plan):
             arena = _allocate_core_arena(core_plan)
         else:
             if pool.shared_arena.device != plan.device:
