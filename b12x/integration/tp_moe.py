@@ -37,6 +37,7 @@ from b12x.moe.fused.micro import (
     _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM,
     _direct_k_segments_for_k,
     _direct_k_segments_supported,
+    MoEMicroKernelBackend as _DirectMoEMicroKernelBackend,
 )
 from b12x.moe.tuning import lookup_max_active_clusters
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
@@ -353,11 +354,19 @@ class _ActivationKernelSpec:
         return self.micro_kernel_cls(**kernel_kwargs)
 
     def make_static_kernel(self, *, num_topk: int, **kernel_kwargs):
+        if self.static_kernel_cls is None:
+            raise RuntimeError(
+                f"{self.activation} has no compact static kernel for this quant mode"
+            )
         if self.is_gated:
             kernel_kwargs["exact_mma_m_tiles"] = num_topk == 1
         return self.static_kernel_cls(**kernel_kwargs)
 
     def make_dynamic_kernel(self, **kernel_kwargs):
+        if self.dynamic_kernel_cls is None:
+            raise RuntimeError(
+                f"{self.activation} has no compact dynamic kernel for this quant mode"
+            )
         return self.dynamic_kernel_cls(**kernel_kwargs)
 
 
@@ -375,6 +384,106 @@ _ACTIVATION_KERNEL_SPECS = {
         micro_kernel_cls=MoEMicroKernelRelu2,
         static_kernel_cls=MoEStaticKernelRelu2,
         dynamic_kernel_cls=MoEDynamicKernelRelu2,
+    ),
+}
+
+
+class _W4A16MoEMicroKernelBackend(_DirectMoEMicroKernelBackend):
+    """Low-latency direct W4A16 path for decode-sized routed batches."""
+
+    _SUPPORTED_M = (1, 2, 4, 8, 10, 12, 16, 24, 32)
+
+    @classmethod
+    def is_supported(
+        cls,
+        m: int,
+        k: int,
+        n: int,
+        num_topk: int,
+        weight_E: int,
+    ) -> bool:
+        if m not in cls._SUPPORTED_M:
+            return False
+        if k <= 0 or k % _NVFP4_BLOCK_SIZE != 0 or k % 128 != 0:
+            return False
+        if not _direct_k_segments_supported(_direct_k_segments_for_k(k)):
+            return False
+        if n <= 0 or n % _NVFP4_BLOCK_SIZE != 0:
+            return False
+        if m >= 4 and n >= 4096:
+            # This direct family is tuned for GLM decode-width FC1. Wider
+            # multi-token batches should stay on the newer workspace backend.
+            return False
+        rows_per_warp = max(1, int(m))
+        fc1_chunks = max(1, int(n) // (_NVFP4_BLOCK_SIZE * rows_per_warp))
+        if int(n) % fc1_chunks != 0:
+            return False
+        i_chunk = int(n) // fc1_chunks
+        return (
+            i_chunk % _NVFP4_BLOCK_SIZE == 0
+            and 0 < num_topk <= 32
+            and weight_E > 0
+        )
+
+    def __init__(
+        self,
+        sf_vec_size: int,
+        mma_tiler_mn: Tuple[int, int],
+        output_tile_count_n: int,
+        *,
+        fast_math: bool = False,
+        activation: str = "silu",
+        share_input_across_experts: bool = False,
+        share_expert_scales: bool = False,
+        single_token: bool = False,
+        dynamic_down_scale: bool = False,
+    ):
+        super().__init__(
+            sf_vec_size,
+            mma_tiler_mn,
+            output_tile_count_n,
+            fast_math=fast_math,
+            activation=activation,
+            share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
+            single_token=single_token,
+            dynamic_down_scale=dynamic_down_scale,
+            w4a16_mode=True,
+        )
+
+
+class _W4A16MoEMicroKernelSilu(_W4A16MoEMicroKernelBackend):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, activation="silu", **kwargs)
+
+
+class _W4A16MoEMicroKernelRelu2(_W4A16MoEMicroKernelBackend):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, activation="relu2", **kwargs)
+
+
+class _UnsupportedW4A16CompactKernel:
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "W4A16 compact static/dynamic kernels are not wired in this path; "
+            "use direct micro for decode-sized batches or the W4A16 workspace backend"
+        )
+
+
+_W4A16_ACTIVATION_KERNEL_SPECS = {
+    "silu": _ActivationKernelSpec(
+        activation="silu",
+        is_gated=True,
+        micro_kernel_cls=_W4A16MoEMicroKernelSilu,
+        static_kernel_cls=_UnsupportedW4A16CompactKernel,
+        dynamic_kernel_cls=_UnsupportedW4A16CompactKernel,
+    ),
+    "relu2": _ActivationKernelSpec(
+        activation="relu2",
+        is_gated=False,
+        micro_kernel_cls=_W4A16MoEMicroKernelRelu2,
+        static_kernel_cls=_UnsupportedW4A16CompactKernel,
+        dynamic_kernel_cls=_UnsupportedW4A16CompactKernel,
     ),
 }
 
@@ -433,10 +542,13 @@ def _get_activation_kernel_spec(
     *,
     quant_mode: str = "nvfp4",
 ) -> _ActivationKernelSpec:
-    if _normalize_quant_mode(quant_mode) == "w4a16":
-        raise ValueError("W4A16 dispatch uses b12x.moe.fused.w4a16.kernel directly")
+    specs = (
+        _W4A16_ACTIVATION_KERNEL_SPECS
+        if _normalize_quant_mode(quant_mode) == "w4a16"
+        else _ACTIVATION_KERNEL_SPECS
+    )
     try:
-        return _ACTIVATION_KERNEL_SPECS[activation]
+        return specs[activation]
     except KeyError as exc:
         raise ValueError(f"unsupported activation {activation!r}") from exc
 
@@ -587,6 +699,10 @@ def _get_static_compact_cutover_pairs(quant_mode: str = "nvfp4") -> int:
             cached = max(0, int(cutover))
         _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[quant_mode] = cached
     return cached
+
+
+def _w4a16_micro_direct_enabled() -> bool:
+    return _env_flag("B12X_W4A16_MICRO_DIRECT", default=True)
 
 
 def _get_micro_compact_cutover_pairs() -> int:
@@ -1034,21 +1150,16 @@ def _plan_core_workspace(
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
-    direct_micro_k_supported = (
-        k > 0
-        and k % _NVFP4_BLOCK_SIZE == 0
-        and k % 128 == 0
-        and _direct_k_segments_supported(_direct_k_segments_for_k(k))
-    )
-    direct_micro_token_supported = direct_micro_tokens in (1, 2, 4, 8)
     direct_micro_candidate = (
         implementation == "static"
-        and n % _NVFP4_BLOCK_SIZE == 0
-        and direct_micro_k_supported
-        and 0 < num_topk <= 32
-        and weight_E > 0
+        and activation_spec.micro_kernel_cls.is_supported(
+            m=direct_micro_tokens,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            weight_E=weight_E,
+        )
         and routed_rows == direct_micro_tokens * num_topk
-        and direct_micro_token_supported
     )
     barrier_slots = max(1, routed_rows)
     if direct_micro_candidate:
@@ -1723,6 +1834,38 @@ def _make_workspace_plan(
     )
 
 
+def _make_compact_static_workspace_plan(
+    *,
+    num_tokens: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    quant_mode: str = "nvfp4",
+    activation: str = "silu",
+) -> TPMoEPlan:
+    quant_mode = _normalize_quant_mode(quant_mode)
+    activation = _normalize_workspace_activation(activation, quant_mode=quant_mode)
+    routed_rows = max(1, int(num_tokens) * int(num_topk))
+    return TPMoEPlan(
+        implementation="static",
+        quant_mode=quant_mode,
+        activation=activation,
+        state_E=routed_rows,
+        weight_E=weight_E,
+        routed_rows=routed_rows,
+        max_rows=routed_rows,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=dtype,
+        max_tokens_per_launch=num_tokens,
+    )
+
+
 def _make_exact_relu2_bs1_nemotron_plan(
     *,
     device: torch.device,
@@ -2332,7 +2475,7 @@ def _get_static_kernel(
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
-    dynamic_down_scale = _dynamic_down_scale_enabled()
+    dynamic_down_scale = False if quant_mode == "w4a16" else _dynamic_down_scale_enabled()
     if num_topk > 1:
         mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
 
@@ -2572,7 +2715,7 @@ def _get_micro_kernel(
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
-    dynamic_down_scale = _dynamic_down_scale_enabled()
+    dynamic_down_scale = False if quant_mode == "w4a16" else _dynamic_down_scale_enabled()
 
     global _LAST_KERNEL
     cache_key = (
@@ -3309,6 +3452,191 @@ def _resolve_scatter_output(
     return scatter_output
 
 
+def _can_use_w4a16_micro_direct(
+    *,
+    source_format: str,
+    apply_router_weight_on_input: bool,
+    launch_rows: int | None,
+    output_rows: int | None,
+    input_m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    weight_E: int,
+    activation: str,
+) -> bool:
+    if not _w4a16_micro_direct_enabled():
+        return False
+    if source_format != "modelopt":
+        return False
+    if apply_router_weight_on_input:
+        return False
+    if launch_rows is not None and int(launch_rows) != int(input_m):
+        return False
+    if output_rows is not None and int(output_rows) != int(input_m):
+        return False
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode="w4a16")
+    return activation_spec.micro_kernel_cls.is_supported(
+        m=int(input_m),
+        k=int(k),
+        n=int(n),
+        num_topk=int(num_topk),
+        weight_E=int(weight_E),
+    )
+
+
+def _try_launch_w4a16_micro_direct(
+    *,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor | None,
+    input_scales_static: bool,
+    fast_math: bool,
+    activation: str,
+    source_format: str,
+    apply_router_weight_on_input: bool,
+    launch_rows: int | None,
+    output_rows: int | None,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    input_m = int(a.shape[0])
+    if (
+        topk_ids.shape[0] != input_m
+        or topk_weights.shape[0] != input_m
+        or not _can_use_w4a16_micro_direct(
+            source_format=source_format,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            launch_rows=launch_rows,
+            output_rows=output_rows,
+            input_m=input_m,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            weight_E=weight_E,
+            activation=activation,
+        )
+    ):
+        return None
+
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode="w4a16")
+    plan = _make_compact_static_workspace_plan(
+        num_tokens=input_m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=a.dtype,
+        quant_mode="w4a16",
+        activation=activation,
+    )
+    resolved = _resolve_workspace(
+        workspace,
+        plan=plan,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        input_scales_static=input_scales_static,
+    )
+    if not isinstance(resolved, TPCompactStaticWorkspace):
+        return None
+
+    flat_ids = _flatten_routing_ids(topk_ids)
+    flat_weights = _flatten_routing_weights(topk_weights)
+    weights = _get_weight_views(
+        w1_fp4,
+        w1_blockscale,
+        w2_fp4,
+        w2_blockscale,
+        w1_alphas,
+        w2_alphas,
+        n,
+        k,
+        activation_spec=activation_spec,
+    )
+    micro_cls = activation_spec.micro_kernel_cls
+    compiled, grid_x = _get_micro_kernel(
+        weight_E,
+        input_m,
+        k,
+        n,
+        num_topk,
+        topk_ids_dtype=flat_ids.dtype,
+        fast_math=fast_math,
+        share_input_across_experts=(
+            activation in ("relu2", "silu")
+            and input_m == 1
+            and a1_gscale.numel() == 1
+            and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
+        ),
+        share_expert_scales=(
+            activation in ("relu2", "silu")
+            and a1_gscale.numel() == 1
+            and a2_gscale.numel() == 1
+        ),
+        single_token=(input_m == 1),
+        activation=activation,
+        device=device,
+        quant_mode="w4a16",
+    )
+    if not _compiled_direct_micro_accepts_block_dim(
+        compiled,
+        _DIRECT_MICRO_BLOCK_DIM,
+    ):
+        return None
+
+    scatter_output = _resolve_scatter_output(
+        a=a,
+        output=output,
+        device=device,
+        m=input_m,
+        k=k,
+    )
+    if flat_ids.dtype in (torch.int32, torch.int64) and flat_ids.is_contiguous():
+        launch_ids = flat_ids
+    else:
+        launch_ids = resolved.compact_topk_ids[: flat_ids.numel()]
+        launch_ids.copy_(flat_ids.to(torch.int32))
+
+    input_gs = _prepare_expert_scale(a1_gscale, weight_E)
+    down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
+    _reset_volatile_launch_state(resolved)
+    micro_cls.launch(
+        compiled,
+        x=a,
+        w1_fp4=weights.w1_storage,
+        w1_blockscale=weights.w1_scale_storage,
+        w1_alphas=weights.w1_alpha,
+        a1_gscale=input_gs,
+        a2_gscale=down_input_scale,
+        inter_fp32=resolved.micro_intermediate,
+        w2_fp4=weights.w2_storage,
+        w2_blockscale=weights.w2_scale_storage,
+        w2_alphas=weights.w2_alpha,
+        topk_ids=launch_ids.view(input_m, num_topk),
+        topk_weights=flat_weights.view(input_m, num_topk),
+        out=scatter_output,
+        barrier_count=resolved.barrier_count,
+        barrier_epoch=resolved.barrier_epoch,
+        m=input_m,
+        grid_x=grid_x,
+    )
+    return scatter_output
+
+
 def _launch_exact_relu2_bs1_nemotron(
     *,
     workspace: TPMoEWorkspace | TPMoEWorkspacePool,
@@ -3503,7 +3831,7 @@ def _launch_compact_static(
     quant_mode = _normalize_quant_mode(quant_mode)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     micro_cls = activation_spec.micro_kernel_cls
-    use_micro_direct = quant_mode == "nvfp4" and micro_cls.is_supported(
+    use_micro_direct = quant_mode in {"nvfp4", "w4a16"} and micro_cls.is_supported(
         m=m,
         k=k,
         n=n,
@@ -3557,6 +3885,12 @@ def _launch_compact_static(
                 grid_x=grid_x,
             )
             return
+
+    if quant_mode == "w4a16":
+        raise RuntimeError(
+            "W4A16 compact static dispatch only supports the direct micro path; "
+            "unsupported shapes must use the W4A16 workspace backend"
+        )
 
     static_mac = _get_impl_mac("static", routed_rows=routed_rows)
     if routed_rows <= 16:
@@ -3692,6 +4026,36 @@ def b12x_moe_fp4(
         a1_gscale.numel() == 1 and a2_gscale.numel() == 1
     )
     if quant_mode == "w4a16":
+        micro_output = _try_launch_w4a16_micro_direct(
+            workspace=workspace,
+            a=a,
+            a1_gscale=a1_gscale,
+            w1_fp4=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            input_scales_static=effective_input_scales_static,
+            fast_math=fast_math,
+            activation=activation,
+            source_format=source_format,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            launch_rows=launch_rows,
+            output_rows=output_rows,
+            weight_E=weight_E,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+        )
+        if micro_output is not None:
+            return micro_output
+
         from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
 
         launch_m = input_m if launch_rows is None else int(launch_rows)
