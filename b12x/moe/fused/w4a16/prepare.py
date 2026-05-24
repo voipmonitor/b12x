@@ -19,6 +19,7 @@ from b12x.moe.fused.w4a16.host import (
 _PACKED_TILE_SIZE = 16
 _PACKED_TILE_N_SIZE = 64
 _PACK_FACTOR_4BIT = 8
+_MODEL_OPT_W13_LAYOUTS = {"modelopt", "gate_up"}
 _SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
     "modelopt_nvfp4_b12x": "modelopt_nvfp4_b12x",
@@ -44,6 +45,27 @@ class W4A16PackedWeights:
     params_dtype: torch.dtype
     source_format: str = "modelopt_nvfp4"
     weight_layout: str = "packed"
+
+
+@dataclass(frozen=True)
+class W4A16ModelOptWeights:
+    w13: torch.Tensor
+    w13_scale: torch.Tensor
+    w13_global_scale: torch.Tensor
+    w2: torch.Tensor
+    w2_scale: torch.Tensor
+    w2_global_scale: torch.Tensor
+    workspace: torch.Tensor
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    is_gated: bool
+    params_dtype: torch.dtype
+    source_format: str = "modelopt_nvfp4"
+    weight_layout: str = "modelopt"
+    # "modelopt" is checkpoint-order [up, gate]. "gate_up" is the B12X/FI
+    # order produced by vLLM's NVFP4 normalization.
+    w13_layout: str = "modelopt"
 
 
 def _make_workspace(
@@ -545,6 +567,112 @@ def prepare_w4a16_modelopt_nvfp4_b12x_weights(
     )
 
 
+def prepare_w4a16_modelopt_native_weights(
+    w13_fp4: torch.Tensor,
+    w13_blockscale: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype = torch.bfloat16,
+    source_format: str = "modelopt_nvfp4",
+    w13_layout: str | None = None,
+) -> W4A16ModelOptWeights:
+    """Prepare W4A16 metadata while keeping ModelOpt FP4 weights native.
+
+    This is the memory-safe path for GLM serving that needs A4 prefill and A16
+    decode in the same process. It keeps the checkpoint FP4 tensors resident
+    instead of materializing a second full W4A16 packed copy.
+    """
+    source_format = _normalize_source_format(source_format)
+    if source_format not in _MODEL_OPT_NVFP4_FORMATS:
+        raise ValueError(
+            "native W4A16 ModelOpt weights require source_format "
+            "'modelopt_nvfp4' or 'modelopt_nvfp4_b12x'"
+        )
+    if w13_layout is None:
+        w13_layout = "gate_up" if source_format == "modelopt_nvfp4_b12x" else "modelopt"
+    w13_layout = w13_layout.lower()
+    if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
+        raise ValueError(
+            "w13_layout must be one of 'modelopt' or 'gate_up', "
+            f"got {w13_layout!r}"
+        )
+
+    shape = validate_w4a16_packed_inputs(
+        w13_fp4,
+        w13_global_scale,
+        w2_fp4,
+        w2_global_scale,
+        activation=activation,
+    )
+    num_experts = shape.num_experts
+    hidden_size = shape.hidden_size
+    intermediate_size = shape.intermediate_size
+    w13_rows = shape.w13_rows
+    is_gated = shape.is_gated
+
+    w13_scale = unswizzle_expert_scales(
+        w13_blockscale,
+        rows=w13_rows,
+        cols=hidden_size,
+    )
+    w2_scale = unswizzle_expert_scales(
+        w2_blockscale,
+        rows=hidden_size,
+        cols=intermediate_size,
+    )
+    w13_global_scale = _source_global_scale(
+        w13_global_scale,
+        source_format=source_format,
+    )
+    w2_global_scale = _source_global_scale(
+        w2_global_scale,
+        source_format=source_format,
+    )
+
+    # The W4A16 activation consumes FC1 output as [gate, up]. Native ModelOpt
+    # checkpoints store gated W13 as [up, gate], while vLLM's B12X path already
+    # normalizes it to [gate, up].
+    w13_row_rotation = (
+        intermediate_size if is_gated and w13_layout == "modelopt" else None
+    )
+    packed_w13_scale, packed_w13_global_scale = _permute_nvfp4_scales(
+        w13_scale,
+        w13_global_scale,
+        size_k=hidden_size,
+        size_n=w13_rows,
+        a_dtype=params_dtype,
+        row_rotation=w13_row_rotation,
+    )
+    packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
+        w2_scale,
+        w2_global_scale,
+        size_k=intermediate_size,
+        size_n=hidden_size,
+        a_dtype=params_dtype,
+    )
+
+    return W4A16ModelOptWeights(
+        w13=w13_fp4,
+        w13_scale=packed_w13_scale,
+        w13_global_scale=packed_w13_global_scale,
+        w2=w2_fp4,
+        w2_scale=packed_w2_scale,
+        w2_global_scale=packed_w2_global_scale,
+        workspace=_make_workspace(w13_fp4.device, max_blocks_per_sm=4),
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        is_gated=is_gated,
+        params_dtype=params_dtype,
+        source_format=source_format,
+        w13_layout=w13_layout,
+    )
+
+
 def prepare_w4a16_compressed_tensors_weights(
     w13_fp4: torch.Tensor,
     w13_blockscale: torch.Tensor,
@@ -649,7 +777,7 @@ def prepare_w4a16_packed_weights(
 
 
 def make_w4a16_packed_buffers(
-    prepared: W4A16PackedWeights,
+    prepared: W4A16PackedWeights | W4A16ModelOptWeights,
     *,
     m: int,
     topk: int,
@@ -669,9 +797,11 @@ def make_w4a16_packed_buffers(
 
 __all__ = [
     "W4A16PackedBuffers",
+    "W4A16ModelOptWeights",
     "W4A16PackedWeights",
     "make_w4a16_packed_buffers",
     "prepare_w4a16_compressed_tensors_weights",
+    "prepare_w4a16_modelopt_native_weights",
     "prepare_w4a16_modelopt_nvfp4_b12x_weights",
     "prepare_w4a16_modelopt_nvfp4_weights",
     "prepare_w4a16_mxfp4_native_weights",
