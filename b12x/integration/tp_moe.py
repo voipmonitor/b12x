@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import weakref
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
@@ -49,9 +50,11 @@ _DYNAMIC_SLICE_CHUNK = 1
 _MOE_FORCE_A16_ENV = "B12X_MOE_FORCE_A16"
 _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
+    "modelopt_nvfp4_b12x": "modelopt_nvfp4_b12x",
     "mxfp4_native": "mxfp4_native",
     "compressed_tensors": "compressed_tensors",
 }
+_MODEL_OPT_NVFP4_SOURCE_FORMATS = {"modelopt_nvfp4", "modelopt_nvfp4_b12x"}
 
 
 @dataclass(kw_only=True)
@@ -409,7 +412,7 @@ def _normalize_fp4_source_format(source_format: str) -> str:
     except KeyError as exc:
         raise ValueError(
             "source_format must be one of 'modelopt_nvfp4', "
-            "'mxfp4_native', or 'compressed_tensors', "
+            "'modelopt_nvfp4_b12x', 'mxfp4_native', or 'compressed_tensors', "
             f"got {source_format!r}"
         ) from exc
 
@@ -417,11 +420,11 @@ def _normalize_fp4_source_format(source_format: str) -> str:
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
-    if source_format != "modelopt_nvfp4" and quant_mode != "w4a16":
+    if source_format not in _MODEL_OPT_NVFP4_SOURCE_FORMATS and quant_mode != "w4a16":
         raise ValueError(
             f"source_format={source_format!r} is only supported with "
             "quant_mode='w4a16'; the NVFP4 kernels currently support only "
-            "source_format='modelopt_nvfp4'"
+            "source_format='modelopt_nvfp4' or 'modelopt_nvfp4_b12x'"
         )
 
 
@@ -472,7 +475,7 @@ _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
 _PLAIN_PARAM_CACHE: Dict[
     Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int],
-    torch.Tensor,
+    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor],
 ] = {}
 _W4A16_ALPHA_CACHE: Dict[Tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
@@ -706,11 +709,14 @@ def _get_plain_cuda_tensor(
         )
         cached = _PLAIN_PARAM_CACHE.get(key)
         if cached is not None:
-            return cached
+            cached_source, cached_plain = cached
+            if cached_source() is t:
+                return cached_plain
+            _PLAIN_PARAM_CACHE.pop(key, None)
         plain = torch.empty(tuple(t.shape), dtype=target_dtype, device=t.device)
         with record_function("tp_moe.get_plain_cuda_tensor.copy"):
             plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
-        _PLAIN_PARAM_CACHE[key] = plain
+        _PLAIN_PARAM_CACHE[key] = (weakref.ref(t), plain)
         return plain
 
 
@@ -1576,6 +1582,7 @@ def _get_w4a16_packed_weights(
 ):
     from b12x.moe.fused.w4a16.prepare import (
         prepare_w4a16_compressed_tensors_weights,
+        prepare_w4a16_modelopt_nvfp4_b12x_weights,
         prepare_w4a16_modelopt_nvfp4_weights,
         prepare_w4a16_mxfp4_native_weights,
     )
@@ -1598,6 +1605,8 @@ def _get_w4a16_packed_weights(
         return cached
     if source_format == "modelopt_nvfp4":
         prepare_weights = prepare_w4a16_modelopt_nvfp4_weights
+    elif source_format == "modelopt_nvfp4_b12x":
+        prepare_weights = prepare_w4a16_modelopt_nvfp4_b12x_weights
     elif source_format == "compressed_tensors":
         prepare_weights = prepare_w4a16_compressed_tensors_weights
     elif source_format == "mxfp4_native":
@@ -1696,9 +1705,10 @@ def prepare_b12x_w4a16_modelopt_nvfp4_weights(
         source_format=source_format,
         quant_mode=quant_mode,
     )
-    if source_format != "modelopt_nvfp4":
+    if source_format not in _MODEL_OPT_NVFP4_SOURCE_FORMATS:
         raise ValueError(
-            "W4A16 ModelOpt NVFP4 weights require source_format='modelopt_nvfp4'"
+            "W4A16 ModelOpt NVFP4 weights require source_format='modelopt_nvfp4' "
+            "or 'modelopt_nvfp4_b12x'"
         )
 
     weight_E = int(w1_fp4.shape[0])
@@ -4182,7 +4192,7 @@ def b12x_moe_fp4(
         prepared_w4a16 is None
         and quant_mode_arg is None
         and quant_mode == "w4a16"
-        and source_format != "modelopt_nvfp4"
+        and source_format not in _MODEL_OPT_NVFP4_SOURCE_FORMATS
     ):
         w1_alphas = _w4a16_default_alpha(
             w1_alphas,
@@ -4227,7 +4237,7 @@ def b12x_moe_fp4(
 
         prepared = prepared_w4a16
         if prepared is None:
-            if source_format == "modelopt_nvfp4":
+            if source_format in _MODEL_OPT_NVFP4_SOURCE_FORMATS:
                 w1_prepare_alphas = _w4a16_default_alpha(
                     w1_alphas,
                     a1_gscale,

@@ -21,9 +21,11 @@ _PACKED_TILE_N_SIZE = 64
 _PACK_FACTOR_4BIT = 8
 _SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
+    "modelopt_nvfp4_b12x": "modelopt_nvfp4_b12x",
     "mxfp4_native": "mxfp4_native",
     "compressed_tensors": "compressed_tensors",
 }
+_MODEL_OPT_NVFP4_FORMATS = {"modelopt_nvfp4", "modelopt_nvfp4_b12x"}
 
 
 @dataclass(frozen=True)
@@ -139,7 +141,7 @@ def _normalize_source_format(source_format: str) -> str:
     except KeyError as exc:
         raise ValueError(
             "source_format must be one of 'modelopt_nvfp4', "
-            "'mxfp4_native', or 'compressed_tensors', "
+            "'modelopt_nvfp4_b12x', 'mxfp4_native', or 'compressed_tensors', "
             f"got {source_format!r}"
         ) from exc
 
@@ -408,7 +410,7 @@ def _prepare_w4a16_packed_weights(
         cols=hidden_size,
     )
     w13_row_rotation = None
-    if is_gated:
+    if is_gated and source_format != "modelopt_nvfp4_b12x":
         if reuse_input_storage:
             w13_row_rotation = intermediate_size
         else:
@@ -510,6 +512,39 @@ def prepare_w4a16_modelopt_nvfp4_weights(
     )
 
 
+def prepare_w4a16_modelopt_nvfp4_b12x_weights(
+    w13_fp4: torch.Tensor,
+    w13_blockscale: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype = torch.bfloat16,
+    reuse_input_storage: bool = False,
+) -> W4A16PackedWeights:
+    """Prepare ModelOpt NVFP4 tensors already normalized for B12X NVFP4 MoE.
+
+    vLLM's B12X NVFP4 backend reorders fused gated W13 from checkpoint
+    ``[w1, w3]`` to the B12X/FI runtime ``[w3, w1]`` layout before handing
+    tensors to B12X.  The packed W4A16 preparation must not rotate those rows a
+    second time.
+    """
+    return _prepare_w4a16_packed_weights(
+        w13_fp4,
+        w13_blockscale,
+        w13_global_scale,
+        w2_fp4,
+        w2_blockscale,
+        w2_global_scale,
+        activation=activation,
+        params_dtype=params_dtype,
+        source_format="modelopt_nvfp4_b12x",
+        reuse_input_storage=reuse_input_storage,
+    )
+
+
 def prepare_w4a16_compressed_tensors_weights(
     w13_fp4: torch.Tensor,
     w13_blockscale: torch.Tensor,
@@ -604,6 +639,8 @@ def prepare_w4a16_packed_weights(
     source_format = _normalize_source_format(source_format)
     if source_format == "modelopt_nvfp4":
         return prepare_w4a16_modelopt_nvfp4_weights(*args, **kwargs)
+    if source_format == "modelopt_nvfp4_b12x":
+        return prepare_w4a16_modelopt_nvfp4_b12x_weights(*args, **kwargs)
     if source_format == "compressed_tensors":
         return prepare_w4a16_compressed_tensors_weights(*args, **kwargs)
     if source_format == "mxfp4_native":
@@ -635,6 +672,7 @@ __all__ = [
     "W4A16PackedWeights",
     "make_w4a16_packed_buffers",
     "prepare_w4a16_compressed_tensors_weights",
+    "prepare_w4a16_modelopt_nvfp4_b12x_weights",
     "prepare_w4a16_modelopt_nvfp4_weights",
     "prepare_w4a16_mxfp4_native_weights",
     "prepare_w4a16_packed_weights",

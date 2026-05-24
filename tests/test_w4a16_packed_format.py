@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import weakref
+
 import pytest
 import torch
 
 from b12x.cute.fp4 import swizzle_block_scale
+import b12x.integration.tp_moe as tp_moe
 from b12x.integration.tp_moe import (
     prepare_b12x_w4a16_modelopt_nvfp4_weights,
     prepare_b12x_w4a16_packed_weights,
 )
 from b12x.moe.fused.w4a16.prepare import (
     prepare_w4a16_compressed_tensors_weights,
+    prepare_w4a16_modelopt_nvfp4_b12x_weights,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
     prepare_w4a16_mxfp4_native_weights,
     prepare_w4a16_packed_weights,
@@ -50,6 +54,31 @@ def _make_case(
         _positive_fp8((experts, hidden_size, intermediate_size // 16))
     )
     return w13, w13_blockscale, w2, w2_blockscale
+
+
+def test_plain_param_cache_revalidates_tensor_identity() -> None:
+    tp_moe._PLAIN_PARAM_CACHE.clear()
+    stale_source = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    requested = torch.tensor([3.0, 4.0], dtype=torch.float32)
+    stale_plain = torch.tensor([9.0, 8.0], dtype=torch.float32)
+    key = (
+        requested.data_ptr(),
+        tuple(requested.shape),
+        tuple(requested.stride()),
+        requested.dtype,
+        requested.dtype,
+        int(requested._version),
+    )
+    tp_moe._PLAIN_PARAM_CACHE[key] = (weakref.ref(stale_source), stale_plain)
+
+    actual = tp_moe._get_plain_cuda_tensor(requested)
+
+    assert actual is not stale_plain
+    assert torch.equal(actual, requested)
+    cached_source, cached_plain = tp_moe._PLAIN_PARAM_CACHE[key]
+    assert cached_source() is requested
+    assert cached_plain is actual
+    tp_moe._PLAIN_PARAM_CACHE.clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -429,6 +458,60 @@ def test_integration_modelopt_nvfp4_preparation_converts_fused_nvfp4_alphas(
 
     assert actual.weight_layout == "packed"
     assert actual.source_format == "modelopt_nvfp4"
+    for name in (
+        "w13",
+        "w13_scale",
+        "w13_global_scale",
+        "w2",
+        "w2_scale",
+        "w2_global_scale",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_modelopt_nvfp4_b12x_source_does_not_rotate_gated_w13_twice() -> None:
+    torch.manual_seed(20260524)
+    experts, hidden_size, intermediate_size = 3, 128, 128
+    w13, w13_blockscale, w2, w2_blockscale = _make_case(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation="silu",
+    )
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+
+    half = intermediate_size
+    b12x_w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1).contiguous()
+    b12x_w13_blockscale = torch.cat(
+        [w13_blockscale[:, half:], w13_blockscale[:, :half]], dim=1
+    ).contiguous()
+
+    expected = prepare_w4a16_weights(
+        w13,
+        w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation="silu",
+    )
+    actual = prepare_w4a16_modelopt_nvfp4_b12x_weights(
+        b12x_w13,
+        b12x_w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        activation="silu",
+    )
+
+    assert actual.source_format == "modelopt_nvfp4_b12x"
     for name in (
         "w13",
         "w13_scale",
