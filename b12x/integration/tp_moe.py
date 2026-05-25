@@ -1633,7 +1633,11 @@ def _get_w4a16_packed_weights(
 def _modelopt_w13_layout_for_source(source_format: str) -> str:
     source_format = _normalize_fp4_source_format(source_format)
     if source_format == "modelopt_nvfp4_b12x":
-        return "gate_up"
+        # vLLM's B12X/FI NVFP4 path stores fused W13 in [up, gate] physical
+        # order. The W4A16 kernel consumes gate/up logical order, so native
+        # ModelOpt loads must apply the same source-row rotation as the
+        # ordinary ModelOpt path instead of treating this as pre-rotated.
+        return "modelopt"
     if source_format == "modelopt_nvfp4":
         return "modelopt"
     raise ValueError(

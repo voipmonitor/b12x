@@ -63,8 +63,10 @@ class W4A16ModelOptWeights:
     params_dtype: torch.dtype
     source_format: str = "modelopt_nvfp4"
     weight_layout: str = "modelopt"
-    # "modelopt" is checkpoint-order [up, gate]. "gate_up" is the B12X/FI
-    # order produced by vLLM's NVFP4 normalization.
+    # "modelopt" is the source order whose FC1 rows must be rotated before
+    # the W4A16 SwiGLU epilogue. vLLM's B12X/FI NVFP4 normalization also
+    # uses this physical order for fused W13. "gate_up" means the source is
+    # already in the W4A16 kernel's gate/up logical order.
     w13_layout: str = "modelopt"
 
 
@@ -432,7 +434,7 @@ def _prepare_w4a16_packed_weights(
         cols=hidden_size,
     )
     w13_row_rotation = None
-    if is_gated and source_format != "modelopt_nvfp4_b12x":
+    if is_gated:
         if reuse_input_storage:
             w13_row_rotation = intermediate_size
         else:
@@ -593,7 +595,7 @@ def prepare_w4a16_modelopt_native_weights(
             "'modelopt_nvfp4' or 'modelopt_nvfp4_b12x'"
         )
     if w13_layout is None:
-        w13_layout = "gate_up" if source_format == "modelopt_nvfp4_b12x" else "modelopt"
+        w13_layout = "modelopt"
     w13_layout = w13_layout.lower()
     if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
         raise ValueError(
@@ -633,9 +635,10 @@ def prepare_w4a16_modelopt_native_weights(
         source_format=source_format,
     )
 
-    # The W4A16 activation consumes FC1 output as [gate, up]. Native ModelOpt
-    # checkpoints store gated W13 as [up, gate], while vLLM's B12X path already
-    # normalizes it to [gate, up].
+    # The W4A16 activation consumes FC1 output in gate/up logical order.
+    # ModelOpt source tensors and vLLM's B12X/FI NVFP4-normalized tensors both
+    # need the row rotation here; callers can pass w13_layout="gate_up" only
+    # when the source tensor is already in the kernel logical order.
     w13_row_rotation = (
         intermediate_size if is_gated and w13_layout == "modelopt" else None
     )
