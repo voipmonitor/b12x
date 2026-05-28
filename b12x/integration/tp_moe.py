@@ -2590,6 +2590,7 @@ def _prewarm_w4a16_planned_launches(
     )
     from b12x.moe.fused.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
+        _MAX_DIRECT_TOPK_ROUTE_M,
         compile_w4a16_fused_moe,
         compile_w4a16_topk_sum,
         pack_topk_routes_by_expert,
@@ -2626,6 +2627,10 @@ def _prewarm_w4a16_planned_launches(
                 ("modelopt", "up_gate"),
                 ("modelopt", "gate_up"),
             ):
+                direct_topk_routes = (
+                    token_count <= _MAX_DIRECT_TOPK_ROUTE_M
+                    and weight_layout in {"packed", "modelopt"}
+                )
                 fused_launches[
                     (weight_layout, w13_layout, token_count)
                 ] = compile_w4a16_fused_moe(
@@ -2645,6 +2650,7 @@ def _prewarm_w4a16_planned_launches(
                     swiglu_limit=swiglu_limit,
                     weight_layout=weight_layout,
                     w13_layout=w13_layout,
+                    direct_topk_routes=direct_topk_routes,
                 )
             topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                 m=token_count,

@@ -77,7 +77,7 @@ _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
 _WEIGHT_LAYOUTS = {"packed", "modelopt"}
 _MODEL_OPT_W13_LAYOUTS = {"up_gate", "gate_up"}
-_MAX_DIRECT_TOPK_ROUTE_M = 6
+_MAX_DIRECT_TOPK_ROUTE_M = 16
 
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
@@ -3680,11 +3680,11 @@ def compile_w4a16_fused_moe(
     direct_topk_routes = bool(direct_topk_routes)
     if direct_topk_routes and (
         int(size_m) > _MAX_DIRECT_TOPK_ROUTE_M
-        or weight_layout != "packed"
+        or weight_layout not in _WEIGHT_LAYOUTS
         or bool(zero_fc2_output)
     ):
         raise ValueError(
-            "direct_topk_routes is only valid for small-M packed W4A16 without expert_map"
+            "direct_topk_routes is only valid for small-M W4A16 without expert_map"
         )
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
@@ -4291,7 +4291,7 @@ def run_w4a16_moe(
     stream = current_cuda_stream() if stream is None else stream
     direct_topk_eligible = (
         m <= _MAX_DIRECT_TOPK_ROUTE_M
-        and weight_layout == "packed"
+        and weight_layout in _WEIGHT_LAYOUTS
         and expert_map is None
     )
     use_direct_topk_routes = bool(
@@ -4307,7 +4307,7 @@ def run_w4a16_moe(
         and not use_direct_topk_routes
     ):
         raise RuntimeError(
-            "preplanned W4A16 direct top-k routing requires small-M packed "
+            "preplanned W4A16 direct top-k routing requires small-M "
             "int32 topk_ids without expert_map"
         )
 
