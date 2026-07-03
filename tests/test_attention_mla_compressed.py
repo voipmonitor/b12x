@@ -509,6 +509,34 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
     assert max_abs <= 0.10
     assert cos.item() >= 0.9995
 
+    # Replay the same captured graph with shorter live sections. The launch grid,
+    # workspace, and tensor addresses stay fixed; one of the two capacity-planned
+    # chunks is now wholly empty and must contribute a neutral LSE without running
+    # its gather/MMA pipeline.
+    swa_lengths.fill_(1)
+    indexed_lengths.zero_()
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    expected_short = compressed_sparse_mla_reference(
+        q,
+        swa_cache_bytes,
+        swa_indices,
+        swa_lengths,
+        extra_k_cache=indexed_cache_bytes,
+        extra_indices=indexed_indices,
+        extra_topk_lengths=indexed_lengths,
+        extra_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+    )
+    max_abs_short = (captured_out.float() - expected_short.float()).abs().max().item()
+    cos_short = torch.nn.functional.cosine_similarity(
+        captured_out.float().reshape(-1), expected_short.float().reshape(-1), dim=0
+    )
+    assert max_abs_short <= 0.10
+    assert cos_short.item() >= 0.9995
+
 
 @torch.inference_mode()
 def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
@@ -931,3 +959,173 @@ def test_compressed_mla_rejects_live_mapped_page_table() -> None:
             indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
             sm_scale=_SM_SCALE,
         )
+
+
+@torch.inference_mode()
+def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
+    device = require_sm120()
+    clear_mla_caches()
+
+    rows = 8
+    q = _make_q(rows=rows, seed=311, device=device)
+    swa_cache = _make_cache(
+        tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=312, device=device
+    )
+    attn_sink = torch.linspace(
+        -0.2, 0.15, _LOCAL_Q_HEADS, dtype=torch.float32, device=device
+    )
+
+    def _make_swa(width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+        lengths = torch.empty((rows,), dtype=torch.int32, device=device)
+        for row in range(rows):
+            length = min(width, row + 1)
+            indices[row, :length] = torch.arange(
+                row, row - length, -1, dtype=torch.int32, device=device
+            )
+            lengths[row] = length
+        return indices, lengths
+
+    # The MG prefill kernel requires the FP8 topk widths (512/1024/2048);
+    # decode has no such floor.
+    for mode, width in (("decode", 8), ("extend", 512)):
+        swa_indices, swa_lengths = _make_swa(width)
+        binding = _make_compressed_binding(
+            device=device,
+            rows=rows,
+            topk=width,
+            max_kv_rows=rows * width,
+            q=q,
+            swa_indices=swa_indices,
+            swa_lengths=swa_lengths,
+        )
+        binding.scratch.mode = mode
+        baseline = compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+        ).clone()
+
+        # NaN canary: every output position must be written by the kernel.
+        out = torch.full(
+            (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        returned = compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=out,
+        )
+        assert returned.data_ptr() == out.data_ptr(), mode
+        assert not torch.isnan(out.float()).any(), mode
+        assert torch.equal(out, baseline), mode
+
+    swa_indices, swa_lengths = _make_swa(512)
+    binding = _make_compressed_binding(
+        device=device,
+        rows=rows,
+        topk=512,
+        max_kv_rows=rows * 512,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+    )
+    binding.scratch.mode = "extend"
+    bad_shape = torch.empty(
+        (rows + 1, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    with pytest.raises(ValueError, match="out must have shape"):
+        compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=bad_shape,
+        )
+    bad_dtype = torch.empty(
+        (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
+        dtype=torch.float16,
+        device=device,
+    )
+    with pytest.raises(TypeError, match="out must be bfloat16"):
+        compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=bad_dtype,
+        )
+    non_contiguous = torch.empty(
+        (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM * 2),
+        dtype=torch.bfloat16,
+        device=device,
+    )[..., ::2]
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=non_contiguous,
+        )
+
+
+@torch.inference_mode()
+def test_compressed_mla_prefill_is_run_to_run_deterministic() -> None:
+    """Guards the s4_finalize_row_sum_mg2 scratch-reuse barrier: the epilogue's
+    persistent-max reads must complete before the row-sum reduction overwrites
+    the scratch. Without it, outputs wobble run-to-run (worst for short
+    topk_lengths) and depend on unrelated memory traffic."""
+    device = require_sm120()
+    clear_mla_caches()
+
+    rows, width = 8, 512
+    q = _make_q(rows=rows, seed=411, device=device)
+    swa_cache = _make_cache(
+        tokens=64, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=412, device=device
+    )
+    swa_indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    swa_lengths = torch.empty((rows,), dtype=torch.int32, device=device)
+    for row in range(rows):
+        length = min(width, row + 1)
+        swa_indices[row, :length] = (
+            torch.arange(row, row - length, -1, dtype=torch.int32, device=device)
+            % 64
+        )
+        swa_lengths[row] = length
+    attn_sink = torch.linspace(
+        -0.2, 0.15, _LOCAL_Q_HEADS, dtype=torch.float32, device=device
+    )
+    binding = _make_compressed_binding(
+        device=device,
+        rows=rows,
+        topk=width,
+        max_kv_rows=rows * width,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+    )
+    binding.scratch.mode = "extend"
+
+    def call() -> torch.Tensor:
+        return compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+        ).clone()
+
+    base = call()
+    # Dirty L2/DRAM between runs; a stale/racing read would surface as a
+    # run-to-run difference.
+    garbage = torch.empty(64 * 1024 * 1024, dtype=torch.float32, device=device)
+    for _ in range(10):
+        garbage.uniform_(-1e30, 1e30)
+        assert torch.equal(call(), base)

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+import time
 import traceback
 from collections import OrderedDict
 from contextlib import contextmanager, suppress
@@ -20,14 +21,23 @@ from typing import Any
 _B12X_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _MEMORY_CACHE: OrderedDict[object, Any] = OrderedDict()
 _MEMORY_CACHE_LOCK = RLock()
+_SPEC_MEMO: OrderedDict[tuple[object, ...], Any] = OrderedDict()
+_SPEC_MEMO_LOCK = RLock()
+_SPEC_MEMO_MAX = 8192
+_SPEC_MEMO_HITS = 0
+_SPEC_MEMO_MISSES = 0
 _MEMORY_CACHE_HITS = 0
 _MEMORY_CACHE_MISSES = 0
 _DISK_CACHE_HITS = 0
 _COMPILE_MISSES = 0
+_COMPILE_PROGRESS_LOCK = RLock()
+_COMPILE_PROGRESS_COUNT = 0
+_COMPILE_PROGRESS_TOTAL_SECONDS = 0.0
 _EXECUTOR_CACHE_LOCK = RLock()
 _EXECUTOR_CACHE_ATTR = "_b12x_cached_default_executor"
 _VLLM_ENGINE_STARTED_ENV = "B12X_VLLM_ENGINE_STARTED"
 _POST_ENGINE_START_LOG_ENV = "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START"
+_PRINT_COMPILE_PROGRESS_ENV = "B12X_PRINT_COMPILE_PROGRESS"
 
 
 @dataclass(frozen=True)
@@ -97,6 +107,57 @@ class TensorKey:
         )
 
 
+def _spec_memo_enabled() -> bool:
+    raw = os.environ.get("B12X_CUTE_COMPILE_SPEC_MEMO", "1")
+    return raw.lower() not in {"0", "false", "no", ""}
+
+
+def _spec_memo_key(
+    kind: str,
+    kernel_id: str,
+    version: int,
+    payload: object,
+    extra: object = None,
+) -> tuple[object, ...] | None:
+    # repr() of a JSON-POD payload is content-deterministic and preserves
+    # type distinctions (True vs 1, tuple vs list), so it is a safe memo key.
+    # Non-POD payloads never get stored (see _spec_memo_put callers), which
+    # keeps id-based reprs out of the cache.
+    if not _spec_memo_enabled():
+        return None
+    try:
+        memo_key = (kind, str(kernel_id), int(version), repr(payload), extra)
+        hash(memo_key)
+    except Exception:
+        return None
+    return memo_key
+
+
+def _spec_memo_get(memo_key: tuple[object, ...] | None) -> Any | None:
+    global _SPEC_MEMO_HITS
+    global _SPEC_MEMO_MISSES
+    if memo_key is None:
+        return None
+    with _SPEC_MEMO_LOCK:
+        spec = _SPEC_MEMO.get(memo_key)
+        if spec is None:
+            _SPEC_MEMO_MISSES += 1
+            return None
+        _SPEC_MEMO_HITS += 1
+        _SPEC_MEMO.move_to_end(memo_key)
+        return spec
+
+
+def _spec_memo_put(memo_key: tuple[object, ...] | None, spec: Any) -> None:
+    if memo_key is None:
+        return
+    with _SPEC_MEMO_LOCK:
+        _SPEC_MEMO[memo_key] = spec
+        _SPEC_MEMO.move_to_end(memo_key)
+        while len(_SPEC_MEMO) > _SPEC_MEMO_MAX:
+            _SPEC_MEMO.popitem(last=False)
+
+
 @dataclass(frozen=True)
 class KeyField:
     name: str
@@ -130,8 +191,12 @@ class KernelCompileSpec:
         version: int,
         *facts: object,
     ) -> "KernelCompileSpec":
+        memo_key = _spec_memo_key("facts", kernel_id, version, facts)
+        spec = _spec_memo_get(memo_key)
+        if spec is not None:
+            return spec
         json_key = _compile_spec_json(kernel_id, version, facts)
-        return KernelCompileSpec(
+        spec = KernelCompileSpec(
             kernel_id=str(kernel_id),
             version=int(version),
             fields=(),
@@ -139,6 +204,10 @@ class KernelCompileSpec:
             hash_key=_hash_json_key(json_key),
             legacy=False,
         )
+        # _compile_spec_json raises for non-POD facts, so only POD-validated
+        # specs reach the memo.
+        _spec_memo_put(memo_key, spec)
+        return spec
 
     @staticmethod
     def from_fields(
@@ -146,13 +215,19 @@ class KernelCompileSpec:
         version: int,
         *fields: KeyField | tuple[str, object],
     ) -> "KernelCompileSpec":
+        memo_key = _spec_memo_key("fields", kernel_id, version, fields)
+        spec = _spec_memo_get(memo_key)
+        if spec is not None:
+            return spec
         coerced_fields = tuple(_coerce_key_field(field) for field in fields)
         if all(_is_json_pod(field.value) for field in coerced_fields):
-            return KernelCompileSpec.from_facts(
+            spec = KernelCompileSpec.from_facts(
                 kernel_id,
                 version,
                 *((field.name, field.value) for field in coerced_fields),
             )
+            _spec_memo_put(memo_key, spec)
+            return spec
         return KernelCompileSpec(
             kernel_id=kernel_id,
             version=int(version),
@@ -186,13 +261,19 @@ class KernelCompileSpec:
                 f"compile spec labels length {len(labels)} does not match "
                 f"key length {len(key)}"
             )
+        memo_key = _spec_memo_key("key", kernel_id, version, key, extra=labels)
+        spec = _spec_memo_get(memo_key)
+        if spec is not None:
+            return spec
         if _is_json_pod(key):
             facts = (
                 tuple((str(labels[idx]), value) for idx, value in enumerate(key))
                 if labels is not None
                 else key
             )
-            return KernelCompileSpec.from_facts(kernel_id, version, *facts)
+            spec = KernelCompileSpec.from_facts(kernel_id, version, *facts)
+            _spec_memo_put(memo_key, spec)
+            return spec
         return KernelCompileSpec(
             kernel_id=kernel_id,
             version=int(version),
@@ -583,6 +664,11 @@ def _cute_compile_cache_dir() -> Path:
 
 def _cute_compile_log_enabled() -> bool:
     raw = os.environ.get("B12X_LOG_CUTE_COMPILES", "")
+    return raw.lower() not in {"", "0", "false", "no", "off"}
+
+
+def _cute_compile_progress_enabled() -> bool:
+    raw = os.environ.get(_PRINT_COMPILE_PROGRESS_ENV, "")
     return raw.lower() not in {"", "0", "false", "no", "off"}
 
 
@@ -1215,6 +1301,103 @@ def _log_cute_compile_miss(
     )
 
 
+def _compile_progress_details(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    compile_spec: KernelCompileSpec | None,
+    cache_key: str,
+) -> str:
+    parts = [
+        f"target={_compile_target_name(func)}",
+        f"cache_key={cache_key[:16]}",
+    ]
+    if compile_spec is not None:
+        try:
+            params = json.loads(compile_spec.json_key)["facts"]
+        except Exception:
+            params = compile_spec.json_key
+        parts.extend(
+            (
+                f"kernel={compile_spec.kernel_id}",
+                f"version={compile_spec.version}",
+                f"params={_short_repr(params, max_len=2400)}",
+            )
+        )
+    else:
+        attrs = _compile_target_attrs(func)
+        if attrs:
+            parts.append(f"attrs={_short_repr(attrs, max_len=1200)}")
+        parts.append(
+            f"args={_short_repr(_compile_args_shape_summary(args, kwargs), max_len=2000)}"
+        )
+    return " ".join(parts)
+
+
+def _call_cute_compile(
+    compile_callable: Any,
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    compile_spec: KernelCompileSpec | None,
+    cache_key: str,
+) -> Any:
+    if not _cute_compile_progress_enabled():
+        return compile_callable(func, *args, **kwargs)
+
+    global _COMPILE_PROGRESS_COUNT
+    global _COMPILE_PROGRESS_TOTAL_SECONDS
+    with _COMPILE_PROGRESS_LOCK:
+        _COMPILE_PROGRESS_COUNT += 1
+        compile_number = _COMPILE_PROGRESS_COUNT
+
+    try:
+        details = _compile_progress_details(
+            func,
+            args,
+            kwargs,
+            compile_spec=compile_spec,
+            cache_key=cache_key,
+        )
+    except Exception as exc:
+        details = (
+            f"target={_short_repr(func)} cache_key={cache_key[:16]} "
+            f"details_error={type(exc).__name__}"
+        )
+    print(
+        f"[b12x cute.compile] compile-start number={compile_number} {details}",
+        flush=True,
+    )
+    started = time.perf_counter()
+    try:
+        compiled = compile_callable(func, *args, **kwargs)
+    except BaseException as exc:
+        elapsed = time.perf_counter() - started
+        with _COMPILE_PROGRESS_LOCK:
+            _COMPILE_PROGRESS_TOTAL_SECONDS += elapsed
+            total = _COMPILE_PROGRESS_TOTAL_SECONDS
+        print(
+            f"[b12x cute.compile] compile-failed number={compile_number} "
+            f"duration_s={elapsed:.3f} total_compile_s={total:.3f} {details} "
+            f"error={type(exc).__name__}: {_short_repr(exc, max_len=500)}",
+            flush=True,
+        )
+        raise
+
+    elapsed = time.perf_counter() - started
+    with _COMPILE_PROGRESS_LOCK:
+        _COMPILE_PROGRESS_TOTAL_SECONDS += elapsed
+        total = _COMPILE_PROGRESS_TOTAL_SECONDS
+    print(
+        f"[b12x cute.compile] compile-done number={compile_number} "
+        f"duration_s={elapsed:.3f} total_compile_s={total:.3f} {details}",
+        flush=True,
+    )
+    return compiled
+
+
 def _iter_fingerprint_files(root: Path) -> list[Path]:
     files = []
     for path in root.rglob("*"):
@@ -1754,6 +1937,10 @@ def clear_compile_cache() -> None:
     global _MEMORY_CACHE_MISSES
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES
+    global _SPEC_MEMO_HITS
+    global _SPEC_MEMO_MISSES
+    global _COMPILE_PROGRESS_COUNT
+    global _COMPILE_PROGRESS_TOTAL_SECONDS
     _compile_environment_key.cache_clear()
     _static_compile_cache_context.cache_clear()
     with _MEMORY_CACHE_LOCK:
@@ -1762,11 +1949,18 @@ def clear_compile_cache() -> None:
         _MEMORY_CACHE_MISSES = 0
         _DISK_CACHE_HITS = 0
         _COMPILE_MISSES = 0
+    with _SPEC_MEMO_LOCK:
+        _SPEC_MEMO.clear()
+        _SPEC_MEMO_HITS = 0
+        _SPEC_MEMO_MISSES = 0
+    with _COMPILE_PROGRESS_LOCK:
+        _COMPILE_PROGRESS_COUNT = 0
+        _COMPILE_PROGRESS_TOTAL_SECONDS = 0.0
 
 
 def compile_cache_info() -> dict[str, int | bool]:
     with _MEMORY_CACHE_LOCK:
-        return {
+        info: dict[str, int | bool] = {
             "memory_cache_enabled": _cute_compile_memory_cache_enabled(),
             "memory_cache_size": len(_MEMORY_CACHE),
             "memory_cache_max_size": _cute_compile_memory_cache_size(),
@@ -1776,6 +1970,12 @@ def compile_cache_info() -> dict[str, int | bool]:
             "disk_cache_hits": _DISK_CACHE_HITS,
             "compile_misses": _COMPILE_MISSES,
         }
+    with _SPEC_MEMO_LOCK:
+        info["spec_memo_enabled"] = _spec_memo_enabled()
+        info["spec_memo_size"] = len(_SPEC_MEMO)
+        info["spec_memo_hits"] = _SPEC_MEMO_HITS
+        info["spec_memo_misses"] = _SPEC_MEMO_MISSES
+    return info
 
 
 def compile(
@@ -1880,7 +2080,14 @@ def compile(
             call_kwargs = {
                 k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"
             }
-            compiled = compile_callable(func, *args, **call_kwargs)
+            compiled = _call_cute_compile(
+                compile_callable,
+                func,
+                args,
+                call_kwargs,
+                compile_spec=compile_spec,
+                cache_key=cache_key,
+            )
             with suppress(Exception):
                 _store_cute_compile_to_disk(cache_key, compiled)
             _memory_cache_put(memory_cache_key, compiled)
@@ -1910,7 +2117,14 @@ def compile(
         cache_key=compile_spec if compile_spec is not None else payload,
     )
     call_kwargs = {k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"}
-    compiled = compile_callable(func, *args, **call_kwargs)
+    compiled = _call_cute_compile(
+        compile_callable,
+        func,
+        args,
+        call_kwargs,
+        compile_spec=compile_spec,
+        cache_key=cache_key,
+    )
     if _cute_compile_disk_cache_enabled():
         with suppress(Exception):
             _store_cute_compile_to_disk(cache_key, compiled)

@@ -168,17 +168,23 @@ def _load_value_virtual(
 @cute.jit
 def _emit_global_index_virtual(
     carry_indices,
+    output_page_table,
     row_start: Int32,
     output_index_offset: Int32,
     carry_base: Int32,
     chunk_len: Int32,
     vidx: Int32,
+    row_idx: Int32,
+    page_size: Int32,
     is_first: cutlass.Constexpr[bool],
+    output_physical_slots: cutlass.Constexpr[bool],
 ) -> Int32:
-    """Map a virtual index to a final global K-index.
+    """Map a virtual index to its final logical or physical K-index.
 
     Local elements reconstruct as row_start + vidx + output_index_offset; carried
-    elements pass their already-global index through verbatim (never re-offset).
+    elements pass their already-global logical index through verbatim (never
+    re-offset). The final paged-indexer chunk optionally translates that logical
+    request-relative position through the real page table in this same store.
     """
     gidx = Int32(0)
     if cutlass.const_expr(is_first):
@@ -188,6 +194,15 @@ def _emit_global_index_virtual(
             gidx = row_start + vidx + output_index_offset
         else:
             gidx = Int32(carry_indices[carry_base + (vidx - chunk_len)])
+    if cutlass.const_expr(output_physical_slots):
+        physical_idx = Int32(-1)
+        if gidx >= Int32(0):
+            page_col = gidx // page_size
+            page_offset = gidx - page_col * page_size
+            page_id = Int32(output_page_table[row_idx, page_col])
+            if page_id >= Int32(0):
+                physical_idx = page_id * page_size + page_offset
+        gidx = physical_idx
     return gidx
 
 
@@ -270,7 +285,10 @@ class SparseNSATiledTopkKernel:
         topk: int = _DEFAULT_TOPK,
         zero_row_start: bool = False,
         is_first: bool = True,
+        output_physical_slots: bool = False,
+        extent_splits: int = 1,
     ):
+        self.extent_splits = int(extent_splits)
         self.is_tiled = is_tiled
         self.block_q = int(block_q)
         self.block_k = int(block_k)
@@ -282,6 +300,7 @@ class SparseNSATiledTopkKernel:
         # orchestrator decides whether that tensor is the next chunk's carry buffer
         # or the user's final output.
         self.is_first = bool(is_first)
+        self.output_physical_slots = bool(output_physical_slots)
 
     @cute.jit
     def __call__(
@@ -293,6 +312,7 @@ class SparseNSATiledTopkKernel:
         indices,
         carry_values,
         carry_indices,
+        output_page_table,
         batch_size,
         input_stride,
         num_k_tiles,
@@ -303,6 +323,9 @@ class SparseNSATiledTopkKernel:
         input_index_offset,
         input_extent,
         output_index_offset,
+        output_page_size,
+        out_row_stride,
+        out_row_base,
         stream,
     ):
         self.kernel(
@@ -313,6 +336,7 @@ class SparseNSATiledTopkKernel:
             indices,
             carry_values,
             carry_indices,
+            output_page_table,
             batch_size,
             input_stride,
             num_k_tiles,
@@ -323,6 +347,9 @@ class SparseNSATiledTopkKernel:
             input_index_offset,
             input_extent,
             output_index_offset,
+            output_page_size,
+            out_row_stride,
+            out_row_base,
         ).launch(
             grid=(batch_size, 1, 1),
             block=[_THREADS_PER_CTA, 1, 1],
@@ -339,6 +366,7 @@ class SparseNSATiledTopkKernel:
         indices: cute.Tensor,
         carry_values: cute.Tensor,
         carry_indices: cute.Tensor,
+        output_page_table: cute.Tensor,
         batch_size: Int32,
         input_stride: Int32,
         num_k_tiles: Int32,
@@ -349,15 +377,34 @@ class SparseNSATiledTopkKernel:
         input_index_offset: Int32,
         input_extent: Int32,
         output_index_offset: Int32,
+        output_page_size: Int32,
+        out_row_stride: Int32,
+        out_row_base: Int32,
     ):
         tx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         bid = Int32(bid)
 
+        # extent_splits > 1: pseudo-row decomposition. CTA `bid` selects the
+        # top-k of ONE extent slice of real row bid//splits: slice s covers
+        # [s*input_extent, (s+1)*input_extent) via the existing chunk-clip
+        # logic, so the emitted global indices stay correct. Outputs land at
+        # pseudo-row `bid`; a second (linear) pass folds the slices.
+        data_bid = bid
+        if cutlass.const_expr(self.extent_splits > 1):
+            splits_i = Int32(self.extent_splits)
+            data_bid = bid // splits_i
+            split_id = bid - data_bid * splits_i
+            input_index_offset = input_index_offset + split_id * input_extent
+            output_index_offset = output_index_offset + split_id * input_extent
+            tile_k_offset = tile_k_offset + split_id * (
+                input_extent // Int32(self.block_k)
+            )
+
         row_start = Int32(0)
         if not cutlass.const_expr(self.zero_row_start):
-            row_start = Int32(row_starts[bid])
-        length = Int32(lengths[bid])
+            row_start = Int32(row_starts[data_bid])
+        length = Int32(lengths[data_bid])
         if input_extent > Int32(0):
             row_end = row_start + length
             clipped_start = row_start
@@ -375,14 +422,17 @@ class SparseNSATiledTopkKernel:
                 length = Int32(0)
         topk_capacity = self.topk
         topk_static = Int32(self.topk)
-        out_base = bid * topk_static
-        row_base = bid * input_stride
+        out_row = data_bid * out_row_stride + out_row_base
+        if cutlass.const_expr(self.extent_splits > 1):
+            out_row = out_row + split_id
+        out_base = out_row * topk_static
+        row_base = data_bid * input_stride
         if cutlass.const_expr(self.is_tiled):
             block_q_i = Int32(self.block_q)
             block_k_i = Int32(self.block_k)
             tile_size = Int32(self.block_q * self.block_k)
-            q_tile_idx = bid // block_q_i
-            q_local = bid - q_tile_idx * block_q_i
+            q_tile_idx = data_bid // block_q_i
+            q_local = data_bid - q_tile_idx * block_q_i
             row_base = (
                 q_tile_idx * num_k_tiles * tile_size
                 + tile_k_offset * tile_size
@@ -463,12 +513,16 @@ class SparseNSATiledTopkKernel:
                 indices[out_base + i] = (
                     _emit_global_index_virtual(
                         carry_indices,
+                        output_page_table,
                         row_start,
                         output_index_offset,
                         out_base,
                         length,
                         i,
+                        bid,
+                        output_page_size,
                         self.is_first,
+                        self.output_physical_slots,
                     )
                     if is_valid
                     else Int32(-1)
@@ -831,12 +885,16 @@ class SparseNSATiledTopkKernel:
                 )
                 indices[out_base + idx0] = _emit_global_index_virtual(
                     carry_indices,
+                    output_page_table,
                     row_start,
                     output_index_offset,
                     out_base,
                     length,
                     selected0,
+                    bid,
+                    output_page_size,
                     self.is_first,
+                    self.output_physical_slots,
                 )
             idx1 = idx0 + Int32(_THREADS_PER_CTA)
             if idx1 < topk_static:
@@ -856,12 +914,16 @@ class SparseNSATiledTopkKernel:
                 )
                 indices[out_base + idx1] = _emit_global_index_virtual(
                     carry_indices,
+                    output_page_table,
                     row_start,
                     output_index_offset,
                     out_base,
                     length,
                     selected1,
+                    bid,
+                    output_page_size,
                     self.is_first,
+                    self.output_physical_slots,
                 )
 
 
@@ -872,6 +934,8 @@ def _build_tiled_topk_kernel(
     topk: int,
     zero_row_start: bool = False,
     is_first: bool = True,
+    output_physical_slots: bool = False,
+    extent_splits: int = 1,
 ):
     return SparseNSATiledTopkKernel(
         is_tiled=True,
@@ -880,17 +944,20 @@ def _build_tiled_topk_kernel(
         topk=topk,
         zero_row_start=zero_row_start,
         is_first=is_first,
+        output_physical_slots=output_physical_slots,
+        extent_splits=extent_splits,
     )
 
 
 @lru_cache(maxsize=8)
-def _build_row_topk_kernel(topk: int):
+def _build_row_topk_kernel(topk: int, output_physical_slots: bool = False):
     return SparseNSATiledTopkKernel(
         is_tiled=False,
         block_q=1,
         block_k=1,
         topk=topk,
         zero_row_start=True,
+        output_physical_slots=output_physical_slots,
     )
 
 
@@ -928,8 +995,24 @@ def run_tiled_topk(
     carry_values: torch.Tensor | None = None,
     carry_indices: torch.Tensor | None = None,
     is_first: bool = True,
+    output_page_table: torch.Tensor | None = None,
+    output_page_size: int = 64,
+    extent_splits: int = 1,
+    output_row_stride: int | None = None,
+    output_row_base: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk = _validate_supported_topk(topk, caller="run_tiled_topk")
+    extent_splits = int(extent_splits)
+    if extent_splits > 1:
+        # Level-1 of the two-level fold: each pseudo-row selects one extent
+        # slice; slices are folded by a second linear pass. Slice windows ride
+        # the chunk-clip logic, so a per-slice input_extent is required.
+        if int(input_extent) <= 0:
+            raise ValueError("extent_splits > 1 requires a per-slice input_extent")
+        if not is_first or carry_values is not None or carry_indices is not None:
+            raise ValueError("extent_splits > 1 does not fold carries")
+        if output_page_table is not None:
+            raise ValueError("extent_splits > 1 emits logical indices only")
     if k_end is None and lengths is None:
         raise ValueError("run_tiled_topk requires either k_end or lengths")
     if not tile_logits.is_contiguous():
@@ -952,6 +1035,52 @@ def run_tiled_topk(
         raise ValueError("lengths must be contiguous")
 
     num_q_rows = int(k_start.shape[0])
+    if output_row_stride is None:
+        output_row_stride = extent_splits
+    output_row_stride = int(output_row_stride)
+    output_row_base = int(output_row_base)
+    if output_row_base + extent_splits > output_row_stride:
+        raise ValueError(
+            "output_row_base + extent_splits must fit within output_row_stride, "
+            f"got {output_row_base} + {extent_splits} > {output_row_stride}"
+        )
+    out_rows = num_q_rows * output_row_stride
+    output_physical_slots = output_page_table is not None
+    if output_physical_slots:
+        assert output_page_table is not None
+        if output_page_table.ndim != 2:
+            raise ValueError(
+                "output_page_table must be rank-2, got "
+                f"{tuple(output_page_table.shape)}"
+            )
+        if int(output_page_table.shape[0]) != num_q_rows:
+            raise ValueError(
+                "output_page_table rows must match top-k rows, got "
+                f"{int(output_page_table.shape[0])} != {num_q_rows}"
+            )
+        if output_page_table.dtype != torch.int32:
+            raise ValueError(
+                "output_page_table must have dtype torch.int32, got "
+                f"{output_page_table.dtype}"
+            )
+        if output_page_table.device != tile_logits.device:
+            raise ValueError("output_page_table device must match tile_logits")
+        if int(output_page_table.stride(1)) != 1 or not (
+            output_page_table.is_contiguous() or int(output_page_table.stride(0)) == 0
+        ):
+            raise ValueError(
+                "output_page_table must be contiguous or a row-shared stride-0 view"
+            )
+        if int(output_page_size) <= 0:
+            raise ValueError(
+                f"output_page_size must be positive, got {output_page_size}"
+            )
+        output_page_table_for_kernel = output_page_table
+    else:
+        # The physical mapping branch is constexpr-elided. Reuse row metadata as
+        # its dummy tensor so ordinary tiled top-k remains allocation-free.
+        output_page_table_for_kernel = lengths
+        output_page_size = 1
     num_q_tiles = (num_q_rows + block_q - 1) // block_q
     tile_size = block_q * block_k
     total_elements = int(tile_logits.shape[0])
@@ -966,28 +1095,28 @@ def run_tiled_topk(
 
     if output_indices is None:
         topk_indices = torch.empty(
-            (num_q_rows, topk),
+            (out_rows, topk),
             dtype=torch.int32,
             device=tile_logits.device,
         )
     else:
-        if output_indices.shape != (num_q_rows, topk):
+        if output_indices.shape != (out_rows, topk):
             raise ValueError(
-                f"output_indices must have shape {(num_q_rows, topk)}, got {tuple(output_indices.shape)}"
+                f"output_indices must have shape {(out_rows, topk)}, got {tuple(output_indices.shape)}"
             )
         if not output_indices.is_contiguous():
             raise ValueError("output_indices must be contiguous")
         topk_indices = output_indices
     if output_values is None:
         topk_values = torch.empty(
-            (num_q_rows, topk),
+            (out_rows, topk),
             dtype=torch.float32,
             device=tile_logits.device,
         )
     else:
-        if output_values.shape != (num_q_rows, topk):
+        if output_values.shape != (out_rows, topk):
             raise ValueError(
-                f"output_values must have shape {(num_q_rows, topk)}, got {tuple(output_values.shape)}"
+                f"output_values must have shape {(out_rows, topk)}, got {tuple(output_values.shape)}"
             )
         if not output_values.is_contiguous():
             raise ValueError("output_values must be contiguous")
@@ -1047,7 +1176,13 @@ def run_tiled_topk(
     flat_carry_indices = carry_indices.reshape(-1).contiguous()
 
     kernel = _build_tiled_topk_kernel(
-        block_q, block_k, topk, bool(zero_row_start), bool(is_first)
+        block_q,
+        block_k,
+        topk,
+        bool(zero_row_start),
+        bool(is_first),
+        bool(output_physical_slots),
+        extent_splits,
     )
     input_key_tensor = tile_logits
     lengths_key_tensor = lengths
@@ -1058,6 +1193,7 @@ def run_tiled_topk(
     indices_key_tensor = topk_indices
     carry_values_key_tensor = carry_values
     carry_indices_key_tensor = carry_indices
+    output_page_table_key_tensor = output_page_table_for_kernel
     args = (
         _to_kernel_tensor(flat_input, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_start, cutlass.Int32, assumed_align=4),
@@ -1066,7 +1202,8 @@ def run_tiled_topk(
         _to_kernel_tensor(flat_indices, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(flat_carry_values, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(flat_carry_indices, cutlass.Int32, assumed_align=4),
-        Int32(num_q_rows),
+        _to_kernel_tensor(output_page_table_for_kernel, cutlass.Int32, assumed_align=4),
+        Int32(num_q_rows * extent_splits),
         input_stride,
         Int32(num_k_tiles),
         Int32(tile_k_offset),
@@ -1076,6 +1213,9 @@ def run_tiled_topk(
         Int32(input_index_offset),
         Int32(input_extent),
         Int32(output_index_offset),
+        Int32(output_page_size),
+        Int32(output_row_stride),
+        Int32(output_row_base),
         current_cuda_stream(),
     )
     cache_key = (
@@ -1088,18 +1228,25 @@ def run_tiled_topk(
         _flat_tensor_compile_key(
             "carry_indices", carry_indices_key_tensor, dynamic=True
         ),
+        _tensor_compile_key(
+            "output_page_table",
+            output_page_table_key_tensor,
+            dynamic_dims=(0,),
+        ),
         (
-            "tiled_topk_v19",
+            "tiled_topk_v21",
             topk,
             block_q,
             block_k,
             bool(zero_row_start),
             bool(is_first),
+            bool(output_physical_slots),
+            extent_splits,
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.tiled_topk",
-        3,
+        4,
         cache_key,
         labels=(
             "input",
@@ -1109,6 +1256,7 @@ def run_tiled_topk(
             "topk_indices",
             "carry_values",
             "carry_indices",
+            "output_page_table",
             "policy",
         ),
     )
@@ -1129,8 +1277,15 @@ def run_row_topk(
     output_values: torch.Tensor | None = None,
     output_indices: torch.Tensor | None = None,
     output_index_offset: int = 0,
+    output_gather_table: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact row-wise topk over a dense row-major logits tile."""
+    """Exact row-wise topk over a dense row-major logits tile.
+
+    output_gather_table: optional int32 (rows, width) table; selected logical
+    positions are remapped through it (out = table[row, pos]), turning the
+    pass into a fold over (value, index) candidate pairs. Padded candidates
+    (-inf value, -1 index) propagate -1 naturally.
+    """
     topk = _validate_supported_topk(topk, caller="run_row_topk")
     if row_logits.ndim != 2:
         raise ValueError(f"row_logits must be rank-2, got {tuple(row_logits.shape)}")
@@ -1188,11 +1343,23 @@ def run_row_topk(
     # Row top-k is always a single-chunk (is_first) selection. The carry path is
     # constexpr-elided, so alias the unread carry tensors to the outputs instead
     # of allocating throwaways inside graph-captured serving paths.
+    if output_gather_table is not None:
+        if output_gather_table.shape != (num_q_rows, width):
+            raise ValueError(
+                f"output_gather_table must have shape {(num_q_rows, width)}, "
+                f"got {tuple(output_gather_table.shape)}"
+            )
+        if output_gather_table.dtype != torch.int32:
+            raise ValueError("output_gather_table must be int32")
+        if not output_gather_table.is_contiguous():
+            raise ValueError("output_gather_table must be contiguous")
+        if output_gather_table.device != row_logits.device:
+            raise ValueError("output_gather_table must be on the logits device")
     carry_values = topk_values
     carry_indices = topk_indices
     flat_carry_values = carry_values.reshape(-1)
     flat_carry_indices = carry_indices.reshape(-1)
-    kernel = _build_row_topk_kernel(topk)
+    kernel = _build_row_topk_kernel(topk, output_gather_table is not None)
     input_key_tensor = row_logits
     lengths_key_tensor = lengths
     values_key_tensor = topk_values
@@ -1207,6 +1374,11 @@ def run_row_topk(
         _to_kernel_tensor(flat_indices, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(flat_carry_values, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(flat_carry_indices, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(
+            output_gather_table if output_gather_table is not None else lengths,
+            cutlass.Int32,
+            assumed_align=4,
+        ),
         Int32(num_q_rows),
         Int32(width),
         Int32(0),
@@ -1217,6 +1389,9 @@ def run_row_topk(
         Int32(0),
         Int32(width),
         Int32(output_index_offset),
+        Int32(1),
+        Int32(1),
+        Int32(0),
         current_cuda_stream(),
     )
     cache_key = (
@@ -1229,13 +1404,14 @@ def run_row_topk(
             "carry_indices", carry_indices_key_tensor, dynamic=True
         ),
         (
-            "row_topk_v3",
+            "row_topk_v5",
             topk,
+            output_gather_table is not None,
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.row_topk",
-        3,
+        4,
         cache_key,
         labels=(
             "logits",

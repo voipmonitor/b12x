@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark realistic SGLang-like GLM-5.1 TP8 decode plus eager-prefill chunks."""
+"""Benchmark GLM MLA and traced DeepSeek-V4 compressed-MLA serving shapes."""
 
 from __future__ import annotations
 
@@ -15,26 +15,25 @@ from dataclasses import dataclass, field
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
+import triton
+import triton.language as tl
 
-from b12x.attention.mla.legacy.split import (
-    run_sparse_mla_split_decode_forward,
-    run_sparse_mla_split_decode_merge,
-    select_sparse_mla_split_decode_config,
-)
+from b12x.attention.mla.legacy.split import select_sparse_mla_split_decode_config
 from b12x.attention.indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.attention.workspace import B12XAttentionWorkspace
 from b12x.attention.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
 )
 from b12x.integration.mla import (
+    B12XSparseMLAScratchCaps,
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
     clear_mla_caches,
+    plan_sparse_mla_scratch,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
@@ -49,10 +48,15 @@ from b12x.attention.indexer.persistent_topk import (
     supports_persistent_topk2048,
 )
 from b12x.attention.indexer import (
+    B12XIndexerScratchCaps,
+    INDEXER_SOURCE_LAYOUT_PAGED,
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
     clear_indexer_caches,
     build_paged_mqa_schedule_metadata,
+    index_topk_fp8,
+    plan_indexer_scratch,
+    prepare_paged_indexer_metadata,
     resolve_contiguous_prefill_block_k,
     paged_decode_logits,
     contiguous_logits,
@@ -82,7 +86,7 @@ except Exception:  # pragma: no cover - optional dependency
     _sgl_fast_topk_transform_ragged_fused = None
 
 
-MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
+DEFAULT_GLM52_HF_REPO_ID = "lukealonso/GLM-5.2-NVFP4"
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
 DEFAULT_CACHE_LENS = (1024, 32768, 65536, 131072)
 DEFAULT_PREFILL_Q_LENS = (2048, 16384)
@@ -92,17 +96,14 @@ DEFAULT_TP_RANK = 0
 DEFAULT_POOL_FACTOR = 6
 DEFAULT_GRAPH_WIDTH = 8192
 TARGET_PREFILL64K_BS1_PRESET = "target-prefill64k-bs1"
+TARGET_GLM52_PREFILL4K_CTX16K_PRESET = "target-glm52-prefill4k-ctx16k"
+TARGET_DSV4_TRACE_PRESET = "target-dsv4-trace"
 MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
 _RAGGED_TOPK_CHUNK = 4096
-_MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
-_MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
-_MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
 _NSA_PREFILL_BLOCK_K_ENV = "B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
 _NSA_DECODE_TOPK_BACKEND_ENV = "B12X_NSA_DECODE_TOPK_BACKEND"
-_MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
-_MLA_SINGLE_PASS_TARGET_TOPK = 2048
 
 
 def _align_up(value: int, multiple: int) -> int:
@@ -113,8 +114,110 @@ def _align_down(value: int, multiple: int) -> int:
     return (value // multiple) * multiple
 
 
+@triton.jit
+def _remap_logical_topk_to_physical_kernel(
+    logical_indices,
+    real_page_table,
+    physical_indices,
+    numel,
+    page_table_width,
+    page_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < numel
+    logical = tl.load(logical_indices + offsets, mask=valid, other=-1)
+    page_col = logical // page_size
+    valid_logical = valid & (logical >= 0) & (page_col < page_table_width)
+    page_id = tl.load(
+        real_page_table + page_col,
+        mask=valid_logical,
+        other=-1,
+    )
+    physical = page_id * page_size + logical % page_size
+    physical = tl.where(valid_logical & (page_id >= 0), physical, -1)
+    tl.store(physical_indices + offsets, physical, mask=valid)
+
+
+def _remap_logical_topk_to_physical(
+    *,
+    logical_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    physical_indices: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    if physical_indices.shape != logical_indices.shape:
+        raise ValueError("physical and logical top-k buffers must have the same shape")
+    numel = logical_indices.numel()
+    _remap_logical_topk_to_physical_kernel[(triton.cdiv(numel, 256),)](
+        logical_indices,
+        real_page_table,
+        physical_indices,
+        numel,
+        int(real_page_table.shape[1]),
+        page_size=int(page_size),
+        BLOCK=256,
+        num_warps=4,
+    )
+    return physical_indices
+
+
+def _make_vllm_packed_cache_views(
+    *,
+    index_k_cache: torch.Tensor,
+    mla_kv_cache: torch.Tensor,
+    page_size: int,
+    block_stride_bytes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Copy one index/MLA layer pair into vLLM-style packed block views."""
+    if block_stride_bytes == 0:
+        return index_k_cache, mla_kv_cache
+    if index_k_cache.dtype != torch.uint8 or mla_kv_cache.dtype != torch.uint8:
+        raise ValueError("packed vLLM cache views require uint8 caches")
+    if index_k_cache.ndim != 2 or mla_kv_cache.ndim != 3:
+        raise ValueError("unexpected index/MLA cache ranks for packed vLLM views")
+    num_pages = int(index_k_cache.shape[0])
+    if int(mla_kv_cache.shape[0]) % int(page_size) != 0:
+        raise ValueError("MLA cache token count must be divisible by page_size")
+    if int(mla_kv_cache.shape[0]) // int(page_size) != num_pages:
+        raise ValueError("index and MLA caches must contain the same page count")
+
+    index_page_bytes = int(index_k_cache.shape[1])
+    mla_record_bytes = int(mla_kv_cache.shape[2])
+    mla_page_bytes = int(page_size) * mla_record_bytes
+    occupied_bytes = index_page_bytes + mla_page_bytes
+    if block_stride_bytes < occupied_bytes:
+        raise ValueError(
+            f"packed block stride {block_stride_bytes} is smaller than the "
+            f"index+MLA page bytes {occupied_bytes}"
+        )
+
+    backing_bytes = (num_pages - 1) * block_stride_bytes + occupied_bytes
+    backing = torch.empty(
+        backing_bytes,
+        dtype=torch.uint8,
+        device=index_k_cache.device,
+    )
+    strided_index = torch.as_strided(
+        backing,
+        size=(num_pages, index_page_bytes),
+        stride=(block_stride_bytes, 1),
+    )
+    strided_mla = torch.as_strided(
+        backing[index_page_bytes:],
+        size=(num_pages, int(page_size), mla_record_bytes),
+        stride=(block_stride_bytes, mla_record_bytes, 1),
+    )
+    strided_index.copy_(index_k_cache)
+    strided_mla.copy_(
+        mla_kv_cache.view(num_pages, int(page_size), mla_record_bytes)
+    )
+    return strided_index, strided_mla
+
+
 @dataclass(frozen=True)
 class GLMDecodeContractConfig:
+    num_hidden_layers: int
     num_attention_heads: int
     index_n_heads: int
     index_head_dim: int
@@ -137,6 +240,28 @@ class GLMDecodeContractConfig:
     @property
     def sm_scale(self) -> float:
         return (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+
+    @property
+    def index_cache_page_bytes(self) -> int:
+        scale_bytes = (self.index_head_dim // 128) * 4
+        return self.page_size * (self.index_head_dim + scale_bytes)
+
+    @property
+    def mla_cache_page_bytes(self) -> int:
+        scale_bytes = (self.kv_lora_rank // 128) * 4
+        rope_bytes = self.qk_rope_head_dim * 2
+        return self.page_size * (self.kv_lora_rank + scale_bytes + rope_bytes)
+
+    @property
+    def all_layer_cache_block_bytes(self) -> int:
+        # Useful as a cross-layer packed-layout stress case. Normal GLM-5.2
+        # serving does not use this stride: vLLM groups its full-MLA main and
+        # index caches into one UniformTypeKVCacheSpecs group, then allocates
+        # one contiguous tensor per cache layer. Multi-group layouts such as
+        # DeepSeek V4 can instead expose cross-layer block-strided views.
+        return self.num_hidden_layers * (
+            self.index_cache_page_bytes + self.mla_cache_page_bytes
+        )
 
 
 @dataclass(frozen=True)
@@ -191,12 +316,17 @@ class SanityMetrics:
 class CaseReport:
     case: DecodeCase
     graph_width: int = 0
+    cache_page_stride_bytes: int = 0
+    step_samples_us: tuple[float, ...] = ()
+    mla_samples_us: tuple[float, ...] = ()
+    flashinfer_mla_samples_us: tuple[float, ...] = ()
     metadata_us: float = 0.0
     replay_us: float = 0.0
     indexer_us: float = 0.0
     indexer_logits_us: float = 0.0
     indexer_topk_us: float = 0.0
     mla_us: float = 0.0
+    flashinfer_mla_us: float = 0.0
     mla_forward_us: float = 0.0
     mla_merge_us: float = 0.0
     split_enabled: bool = False
@@ -209,6 +339,8 @@ class CaseReport:
     mla_sanity: SanityMetrics = field(
         default_factory=lambda: SanityMetrics(max_abs=0.0, rmse=0.0, cos=1.0)
     )
+    flashinfer_mla_sanity: SanityMetrics | None = None
+    b12x_vs_flashinfer_sanity: SanityMetrics | None = None
 
     @property
     def total_us(self) -> float:
@@ -218,6 +350,14 @@ class CaseReport:
             return self.indexer_us + self.mla_us
         return self.metadata_us + self.replay_us
 
+    @property
+    def mla_ratio_vs_flashinfer(self) -> float:
+        """B12X latency divided by FlashInfer latency; lower is faster."""
+
+        if self.flashinfer_mla_us <= 0.0:
+            return 0.0
+        return self.mla_us / self.flashinfer_mla_us
+
 
 class BenchmarkFailure(RuntimeError):
     def __init__(self, case: DecodeCase, message: str):
@@ -225,15 +365,41 @@ class BenchmarkFailure(RuntimeError):
         self.case = case
 
 
-def _require_glm_config() -> pathlib.Path:
-    config_path = MODEL_PATH / "config.json"
-    if not config_path.exists():
-        raise SystemExit(f"GLM-5.1 config not found at {config_path}")
-    return config_path
+def _resolve_cached_hf_config(
+    repo_id: str = DEFAULT_GLM52_HF_REPO_ID,
+    *,
+    cache_root: pathlib.Path | None = None,
+) -> pathlib.Path:
+    from huggingface_hub import try_to_load_from_cache
+
+    cached_config = try_to_load_from_cache(
+        repo_id=repo_id,
+        filename="config.json",
+        cache_dir=cache_root,
+        revision="main",
+    )
+    if isinstance(cached_config, str):
+        return pathlib.Path(cached_config)
+
+    cache_desc = "the configured Hugging Face cache" if cache_root is None else str(cache_root)
+    raise SystemExit(
+        f"cached Hugging Face config not found for {repo_id!r} in {cache_desc}; "
+        "populate the cache or pass --model-config /path/to/config.json"
+    )
 
 
-def _load_glm_contract_config(*, tp_size: int, tp_rank: int) -> GLMDecodeContractConfig:
-    config = json.loads(_require_glm_config().read_text())
+def _load_glm_contract_config(
+    *,
+    tp_size: int,
+    tp_rank: int,
+    model_config: pathlib.Path | None = None,
+) -> GLMDecodeContractConfig:
+    if model_config is None:
+        model_config = _resolve_cached_hf_config()
+    model_config = model_config.expanduser()
+    if not model_config.is_file():
+        raise SystemExit(f"model config not found at {model_config}")
+    config = json.loads(model_config.read_text())
     num_attention_heads = int(config["num_attention_heads"])
     if num_attention_heads % tp_size != 0:
         raise SystemExit(
@@ -242,6 +408,7 @@ def _load_glm_contract_config(*, tp_size: int, tp_rank: int) -> GLMDecodeContrac
     if tp_rank < 0 or tp_rank >= tp_size:
         raise SystemExit(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
     return GLMDecodeContractConfig(
+        num_hidden_layers=int(config["num_hidden_layers"]),
         num_attention_heads=num_attention_heads,
         index_n_heads=int(config["index_n_heads"]),
         index_head_dim=int(config["index_head_dim"]),
@@ -254,6 +421,26 @@ def _load_glm_contract_config(*, tp_size: int, tp_rank: int) -> GLMDecodeContrac
     )
 
 
+def _resolve_cache_page_stride_bytes(
+    value: int,
+    cfg: GLMDecodeContractConfig,
+) -> int:
+    value = int(value)
+    if value == -1:
+        return cfg.all_layer_cache_block_bytes
+    if value < 0:
+        raise ValueError(
+            f"cache_page_stride_bytes must be -1, 0, or positive, got {value}"
+        )
+    minimum = cfg.index_cache_page_bytes + cfg.mla_cache_page_bytes
+    if value != 0 and value < minimum:
+        raise ValueError(
+            f"cache_page_stride_bytes={value} is smaller than one index+MLA "
+            f"page pair ({minimum} bytes)"
+        )
+    return value
+
+
 def _parse_csv_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part]
 
@@ -264,72 +451,36 @@ def _format_csv_ints(values: tuple[int, ...]) -> str:
 
 def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
     if args.preset == "none":
-        return args
-    if args.preset != TARGET_PREFILL64K_BS1_PRESET:
+        pass
+    elif args.preset == TARGET_PREFILL64K_BS1_PRESET:
+        args.modes = "prefill"
+        args.batch_sizes = "1"
+        args.cache_lens = "65536"
+        args.verify_q_lens = "2048"
+        args.topk_cap = 2048
+        args.graph_width = 65536
+    elif args.preset == TARGET_GLM52_PREFILL4K_CTX16K_PRESET:
+        args.modes = "prefill"
+        args.batch_sizes = "1"
+        args.cache_lens = "16384"
+        args.verify_q_lens = "4096"
+        args.topk_cap = 2048
+        args.graph_width = 16384
+        args.use_tiled_topk = True
+        args.prefill_indexer_layout = "paged"
+        # Current vLLM's one-group UniformTypeKVCacheSpecs branch allocates
+        # every normal GLM main/index cache as its own contiguous tensor.
+        if args.cache_page_stride_bytes is None:
+            args.cache_page_stride_bytes = 0
+    elif args.preset == TARGET_DSV4_TRACE_PRESET:
+        # main() delegates this distinct compressed-MLA contract to the native
+        # DSV4 benchmark before any GLM config or tensor setup occurs.
+        pass
+    else:
         raise ValueError(f"unknown preset {args.preset!r}")
-
-    args.modes = "prefill"
-    args.batch_sizes = "1"
-    args.cache_lens = "65536"
-    args.verify_q_lens = "2048"
-    args.topk_cap = 2048
-    args.graph_width = 65536
+    if args.cache_page_stride_bytes is None:
+        args.cache_page_stride_bytes = 0
     return args
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _resolve_mla_prefill_strategy() -> str:
-    if _env_flag(_MLA_FORCE_SINGLE_PASS_ENV):
-        return "single"
-    if _env_flag(_MLA_FORCE_SPLIT_ENV):
-        return "split"
-    value = os.environ.get(_MLA_STRATEGY_ENV, "auto").strip().lower()
-    if value in ("auto", ""):
-        return "auto"
-    if value in ("single", "single-pass", "nonsplit", "onepass"):
-        return "single"
-    if value == "split":
-        return "split"
-    raise ValueError(
-        f"{_MLA_STRATEGY_ENV} must be auto, split, or single-pass/nonsplit; got {value!r}"
-    )
-
-
-def _apply_benchmark_mla_split_strategy(
-    *,
-    split_cfg,
-    workspace_mode: str,
-    cache_seqlens: torch.Tensor,
-    device: torch.device,
-    max_batch: int,
-    q_rows: int,
-    topk_width: int,
-):
-    if split_cfg is None:
-        return None
-    strategy = _resolve_mla_prefill_strategy()
-    if strategy == "single":
-        return None
-    if strategy == "split":
-        return split_cfg
-    if (
-        workspace_mode in ("extend", "verify", "draft_extend")
-        and max_batch == 1
-        and q_rows >= _MLA_SINGLE_PASS_TARGET_Q_ROWS
-        and topk_width >= _MLA_SINGLE_PASS_TARGET_TOPK
-    ):
-        return None
-    if (
-        workspace_mode in ("extend", "verify", "draft_extend")
-        and not (device.type == "cuda" and torch.cuda.is_current_stream_capturing())
-    ):
-        max_cache_seqlens = int(cache_seqlens.max())
-        if max_cache_seqlens <= 4096:
-            return None
-    return split_cfg
 
 
 def _resolve_topk(*, cache_len: int, topk_cap: int) -> int:
@@ -439,6 +590,29 @@ def _compare(a: torch.Tensor, b: torch.Tensor) -> SanityMetrics:
         rmse=torch.sqrt(diff.square().mean()).item(),
         cos=cos,
     )
+
+
+def _check_mla_sanity(
+    *,
+    case: DecodeCase,
+    label: str,
+    metrics: SanityMetrics,
+) -> None:
+    if metrics.max_abs > MLA_MAX_ABS_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"{label} max_abs {metrics.max_abs:.6f} exceeded {MLA_MAX_ABS_TOL:.6f}",
+        )
+    if metrics.rmse > MLA_RMSE_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"{label} rmse {metrics.rmse:.6f} exceeded {MLA_RMSE_TOL:.6f}",
+        )
+    if metrics.cos < MLA_COS_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"{label} cos {metrics.cos:.6f} fell below {MLA_COS_TOL:.6f}",
+        )
 
 
 def _resolve_graph_width(*, cache_len: int, graph_width: int) -> int:
@@ -795,7 +969,157 @@ def _make_mla_inputs(
     return q_all, k_nope_pool, k_rope_pool, kv_cache
 
 
-def _make_mla_workspace(
+def _flashinfer_paged_kv_view(
+    kv_cache: torch.Tensor,
+    *,
+    page_size: int,
+) -> torch.Tensor:
+    """Expose b12x's packed GLM records through FlashInfer's paged view."""
+
+    record_bytes = 656
+    if kv_cache.dtype != torch.uint8 or kv_cache.shape[-1] != record_bytes:
+        raise ValueError(
+            "FlashInfer GLM sparse MLA requires a uint8 cache with 656-byte records"
+        )
+    if kv_cache.ndim == 4:
+        if kv_cache.shape[1] != 1 or kv_cache.shape[2] != page_size:
+            raise ValueError(
+                "unexpected 4-D MLA cache shape for FlashInfer: "
+                f"{tuple(kv_cache.shape)}"
+            )
+        return kv_cache
+    if kv_cache.ndim != 3:
+        raise ValueError(
+            f"unexpected MLA cache rank for FlashInfer: {tuple(kv_cache.shape)}"
+        )
+    if kv_cache.shape[1] == page_size:
+        return kv_cache
+    if kv_cache.shape[1] != 1 or kv_cache.shape[0] % page_size != 0:
+        raise ValueError(
+            "cannot form FlashInfer pages from MLA cache shape "
+            f"{tuple(kv_cache.shape)} with page_size={page_size}"
+        )
+    flat_records = kv_cache[:, 0, :]
+    if not flat_records.is_contiguous():
+        raise ValueError(
+            "token-major MLA cache must be contiguous to form a zero-copy "
+            "FlashInfer paged view"
+        )
+    paged = flat_records.view(-1, page_size, record_bytes)
+    if paged.data_ptr() != kv_cache.data_ptr():
+        raise RuntimeError("FlashInfer cache adapter unexpectedly copied the KV cache")
+    return paged
+
+
+def _make_flashinfer_sparse_mla_race(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    selected_indices: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    sm_scale: float,
+    page_size: int,
+):
+    """Build a graph-stable FlashInfer main sparse-MLA launch and output."""
+
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _SparseMLAPagedAttentionRunner,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "--reference flashinfer requires FlashInfer main with the SM120 "
+            "sparse-MLA kernels (PR #3395 or newer)"
+        ) from exc
+
+    if q_all.dtype != torch.bfloat16 or q_all.shape[-1] != 576:
+        raise ValueError(
+            "FlashInfer GLM sparse MLA requires BF16 queries with head dim 576"
+        )
+    if selected_indices.dtype != torch.int32 or selected_indices.ndim != 2:
+        raise ValueError("FlashInfer sparse indices must be a rank-2 int32 tensor")
+    if active_token_counts.dtype != torch.int32 or active_token_counts.ndim != 1:
+        raise ValueError("FlashInfer active top-k lengths must be rank-1 int32")
+    if selected_indices.shape[0] != q_all.shape[0]:
+        raise ValueError("FlashInfer sparse index rows must match query rows")
+    if active_token_counts.shape[0] != q_all.shape[0]:
+        raise ValueError("FlashInfer top-k lengths must match query rows")
+
+    flashinfer_kv_cache = _flashinfer_paged_kv_view(
+        kv_cache,
+        page_size=page_size,
+    )
+    indices = selected_indices.contiguous()
+    topk_lengths = active_token_counts.contiguous()
+    output = torch.empty(
+        (q_all.shape[0], q_all.shape[1], 512),
+        dtype=torch.bfloat16,
+        device=q_all.device,
+    )
+    out_lse = torch.empty(
+        (q_all.shape[0], q_all.shape[1]),
+        dtype=torch.float32,
+        device=q_all.device,
+    )
+    runner = _SparseMLAPagedAttentionRunner(
+        max_num_tokens=q_all.shape[0],
+        max_num_heads=q_all.shape[1],
+        kv_scale_format="arbitrary_fp32",
+        device=q_all.device,
+    )
+
+    mid_out = None
+    mid_lse = None
+    if q_all.shape[0] <= 64:
+        num_splits = (selected_indices.shape[1] + 63) // 64
+        mid_out = torch.empty(
+            (q_all.shape[0], q_all.shape[1], num_splits, 512),
+            dtype=torch.bfloat16,
+            device=q_all.device,
+        )
+        mid_lse = torch.empty(
+            (q_all.shape[0], q_all.shape[1], num_splits),
+            dtype=torch.float32,
+            device=q_all.device,
+        )
+
+    def run_flashinfer_mla() -> torch.Tensor:
+        runner.run(
+            q_all,
+            flashinfer_kv_cache,
+            indices,
+            output,
+            float(sm_scale),
+            topk_length=topk_lengths,
+            out_lse=out_lse,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )
+        return output
+
+    return run_flashinfer_mla, output
+
+
+def _flashinfer_reference_identity() -> tuple[str, str]:
+    """Validate the optional main-only reference and report its exact build."""
+
+    try:
+        import flashinfer
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _SparseMLAPagedAttentionRunner,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "--reference flashinfer requires FlashInfer main with the SM120 "
+            "sparse-MLA kernels (PR #3395 or newer)"
+        ) from exc
+    del _SparseMLAPagedAttentionRunner
+    version = str(getattr(flashinfer, "__version__", "unknown"))
+    revision = str(getattr(flashinfer, "__git_version__", "unknown"))
+    return version, revision
+
+
+def _make_mla_binding(
     *,
     mode: str,
     cfg: GLMDecodeContractConfig,
@@ -803,18 +1127,34 @@ def _make_mla_workspace(
     topk: int,
     max_total_q: int,
     max_batch: int,
-) -> B12XAttentionWorkspace:
-    return B12XAttentionWorkspace.for_fixed_capacity(
-        mode=mode,
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=cfg.num_local_heads,
-        head_dim=cfg.q_head_dim,
-        v_head_dim=cfg.kv_lora_rank,
-        topk=topk,
-        max_total_q=max_total_q,
-        max_batch=max_batch,
+    q_all: torch.Tensor,
+    selected_indices: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    nsa_cache_seqlens_int32: torch.Tensor,
+):
+    plan = plan_sparse_mla_scratch(
+        B12XSparseMLAScratchCaps(
+            mode=mode,
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=cfg.num_local_heads,
+            head_dim=cfg.q_head_dim,
+            v_head_dim=cfg.kv_lora_rank,
+            max_width=topk,
+            max_q_rows=max_total_q,
+            max_batch=max_batch,
+            page_size=cfg.page_size,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch_storage = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    return plan.bind(
+        scratch=scratch_storage,
+        q=q_all,
+        selected_indices=selected_indices,
+        cache_seqlens_int32=cache_seqlens_int32,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
     )
 
 
@@ -868,9 +1208,11 @@ def _run_decode_case(
     device: torch.device,
     pool_factor: int,
     graph_width: int,
+    cache_page_stride_bytes: int,
     l2_flush,
     skip_indexer_logits_fill: bool,
     decode_topk_backend: str,
+    reference: str,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
@@ -901,6 +1243,12 @@ def _run_decode_case(
         device=device,
         pool_locs=pool_locs,
         pool_tokens=pool_tokens,
+    )
+    index_k_cache, kv_cache = _make_vllm_packed_cache_views(
+        index_k_cache=index_k_cache,
+        mla_kv_cache=kv_cache,
+        page_size=cfg.page_size,
+        block_stride_bytes=cache_page_stride_bytes,
     )
     live_candidate_page_table = make_dense_candidate_page_table(
         batch_size=case.batch_size,
@@ -1048,14 +1396,19 @@ def _run_decode_case(
         nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
         max_seq_len_k=aligned_graph_width,
     )
-    mla_workspace = _make_mla_workspace(
+    mla_binding = _make_mla_binding(
         mode="decode",
         cfg=cfg,
         device=device,
         topk=case.topk,
         max_total_q=case.total_q,
         max_batch=case.batch_size,
+        q_all=q_all,
+        selected_indices=mla_metadata.page_table_1,
+        cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
     )
+    mla_workspace = mla_binding.scratch
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -1066,15 +1419,25 @@ def _run_decode_case(
 
     def run_mla():
         return sparse_mla_decode_forward(
-            q_all=q_all,
             kv_cache=kv_cache,
-            page_table_1=mla_metadata.page_table_1,
-            cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
-            workspace=mla_workspace,
+            binding=mla_binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
+
+    run_flashinfer_mla = None
+    flashinfer_output = None
+    if reference == "flashinfer":
+        run_flashinfer_mla, flashinfer_output = _make_flashinfer_sparse_mla_race(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            selected_indices=actual_topk,
+            active_token_counts=graph_nsa_cache_seqlens,
+            sm_scale=cfg.sm_scale,
+            page_size=cfg.page_size,
+        )
+    elif reference != "none":
+        raise ValueError(f"unsupported MLA reference {reference!r}")
 
     def run_step():
         topk_indices = _select_paged_topk_from_logits(
@@ -1092,13 +1455,15 @@ def _run_decode_case(
             topk=case.topk,
             backend=decode_topk_backend,
         )
-        return sparse_mla_decode_forward(
-            q_all=q_all,
-            kv_cache=kv_cache,
-            page_table_1=topk_indices,
+        step_binding = mla_workspace.bind(
+            q=q_all,
+            selected_indices=topk_indices,
             cache_seqlens_int32=graph_cache_seqlens,
             nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-            workspace=mla_workspace,
+        )
+        return sparse_mla_decode_forward(
+            kv_cache=kv_cache,
+            binding=step_binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
@@ -1113,22 +1478,25 @@ def _run_decode_case(
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
+    if run_flashinfer_mla is not None:
+        run_flashinfer_mla()
     torch.cuda.synchronize()
     mla_sanity = _compare(actual_output, expected_output)
-    if mla_sanity.max_abs > MLA_MAX_ABS_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA max_abs {mla_sanity.max_abs:.6f} exceeded {MLA_MAX_ABS_TOL:.6f}",
+    _check_mla_sanity(case=case, label="MLA", metrics=mla_sanity)
+    flashinfer_mla_sanity = None
+    b12x_vs_flashinfer_sanity = None
+    if flashinfer_output is not None:
+        flashinfer_mla_sanity = _compare(flashinfer_output, expected_output)
+        _check_mla_sanity(
+            case=case,
+            label="FlashInfer MLA",
+            metrics=flashinfer_mla_sanity,
         )
-    if mla_sanity.rmse > MLA_RMSE_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA rmse {mla_sanity.rmse:.6f} exceeded {MLA_RMSE_TOL:.6f}",
-        )
-    if mla_sanity.cos < MLA_COS_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA cos {mla_sanity.cos:.6f} fell below {MLA_COS_TOL:.6f}",
+        b12x_vs_flashinfer_sanity = _compare(actual_output, flashinfer_output)
+        _check_mla_sanity(
+            case=case,
+            label="B12X vs FlashInfer MLA",
+            metrics=b12x_vs_flashinfer_sanity,
         )
     del actual_output
     del expected_output
@@ -1181,6 +1549,20 @@ def _run_decode_case(
     )
     mla_us = statistics.median(mla_stats["replay_us"])
 
+    flashinfer_mla_stats = None
+    flashinfer_mla_us = 0.0
+    if run_flashinfer_mla is not None:
+        prepare_decode_graph()
+        flashinfer_mla_stats = _capture_and_bench_cuda_graph(
+            run_flashinfer_mla,
+            warmup=warmup,
+            replays=replays,
+            l2_flush=l2_flush,
+        )
+        flashinfer_mla_us = statistics.median(
+            flashinfer_mla_stats["replay_us"]
+        )
+
     clear_indexer_caches()
     clear_mla_caches()
     step_stats = _capture_and_bench_cuda_graph(
@@ -1193,18 +1575,36 @@ def _run_decode_case(
     return CaseReport(
         case=case,
         graph_width=graph_width,
+        cache_page_stride_bytes=cache_page_stride_bytes,
+        step_samples_us=tuple(
+            metadata_us + replay_us
+            for metadata_us, replay_us in zip(
+                step_stats["metadata_us"],
+                step_stats["replay_us"],
+                strict=True,
+            )
+        ),
+        mla_samples_us=tuple(mla_stats["replay_us"]),
+        flashinfer_mla_samples_us=(
+            ()
+            if flashinfer_mla_stats is None
+            else tuple(flashinfer_mla_stats["replay_us"])
+        ),
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
         indexer_logits_us=indexer_logits_us,
         indexer_topk_us=indexer_topk_us,
         mla_us=mla_us,
+        flashinfer_mla_us=flashinfer_mla_us,
         split_enabled=split_cfg is not None,
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
         indexer_logits_fill=preinitialize_indexer_logits,
         indexer_topk_path=decode_topk_backend.replace("_", "-"),
         mla_sanity=mla_sanity,
+        flashinfer_mla_sanity=flashinfer_mla_sanity,
+        b12x_vs_flashinfer_sanity=b12x_vs_flashinfer_sanity,
     )
 
 
@@ -1218,14 +1618,20 @@ def _run_prefill_or_verify_case(
     device: torch.device,
     pool_factor: int,
     graph_width: int,
+    cache_page_stride_bytes: int,
     l2_flush,
     skip_indexer_logits_fill: bool,
     use_tiled_topk: bool,
+    prefill_indexer_layout: str,
+    reference: str,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
     if case.q_len <= 1:
         raise ValueError(f"prefill q_len must be > 1, got {case.q_len}")
+    use_paged_prefill = case.mode == "prefill" and prefill_indexer_layout == "paged"
+    if use_paged_prefill and case.batch_size != 1:
+        raise ValueError("paged prefill indexer benchmark requires batch_size=1")
     graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
     aligned_graph_width = _align_up(graph_width, cfg.page_size)
     pool_tokens = _align_up(max(case.cache_len, case.cache_len * pool_factor), cfg.page_size)
@@ -1254,6 +1660,12 @@ def _run_prefill_or_verify_case(
         pool_locs=pool_locs,
         pool_tokens=pool_tokens,
     )
+    index_k_cache, kv_cache = _make_vllm_packed_cache_views(
+        index_k_cache=index_k_cache,
+        mla_kv_cache=kv_cache,
+        page_size=cfg.page_size,
+        block_stride_bytes=cache_page_stride_bytes,
+    )
     base_real_page_table = make_dense_real_page_table(
         batch_size=case.batch_size,
         token_locs=pool_locs,
@@ -1265,10 +1677,15 @@ def _run_prefill_or_verify_case(
         dtype=torch.int32,
         device=device,
     ).repeat_interleave(case.q_len)
-    live_real_page_table = base_real_page_table.index_select(
-        0,
-        query_row_to_batch.to(torch.long),
-    ).contiguous()
+    if use_paged_prefill:
+        # vLLM expands the single request's block table across all query rows;
+        # preserving stride(0)==0 is part of the production b12x contract.
+        live_real_page_table = base_real_page_table[:1].expand(case.total_q, -1)
+    else:
+        live_real_page_table = base_real_page_table.index_select(
+            0,
+            query_row_to_batch.to(torch.long),
+        ).contiguous()
     batch_cache_seqlens = torch.full(
         (case.batch_size,),
         case.cache_len,
@@ -1296,18 +1713,31 @@ def _run_prefill_or_verify_case(
         dtype=torch.int32,
         device=device,
     )
-    graph_real_page_table = torch.full(
-        (case.total_q, aligned_graph_width // cfg.page_size),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
+    if use_paged_prefill:
+        graph_real_page_table_storage = torch.full(
+            (1, aligned_graph_width // cfg.page_size),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        graph_real_page_table = graph_real_page_table_storage.expand(case.total_q, -1)
+    else:
+        graph_real_page_table_storage = None
+        graph_real_page_table = torch.full(
+            (case.total_q, aligned_graph_width // cfg.page_size),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
     graph_batch_cache_seqlens = torch.empty_like(batch_cache_seqlens)
     graph_expanded_cache_seqlens = torch.empty_like(expanded_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
-    use_graph_schedule_metadata = uses_paged_mqa_schedule(
-        q_rows=case.total_q,
-        max_pages=graph_real_page_table.shape[1],
+    use_graph_schedule_metadata = (
+        not use_paged_prefill
+        and uses_paged_mqa_schedule(
+            q_rows=case.total_q,
+            max_pages=graph_real_page_table.shape[1],
+        )
     )
     graph_schedule_metadata = (
         torch.empty(
@@ -1332,9 +1762,19 @@ def _run_prefill_or_verify_case(
     graph_contiguous_lengths = torch.empty_like(live_contiguous_lengths)
 
     def prepare_verify_graph() -> None:
-        graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(live_real_page_table)
+        if use_paged_prefill:
+            assert graph_real_page_table_storage is not None
+            graph_real_page_table_storage[0, : live_real_page_table.shape[1]].copy_(
+                live_real_page_table[0]
+            )
+        else:
+            graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(
+                live_real_page_table
+            )
         graph_batch_cache_seqlens.copy_(batch_cache_seqlens)
-        graph_expanded_cache_seqlens.copy_(expanded_cache_seqlens)
+        graph_expanded_cache_seqlens.copy_(
+            live_contiguous_lengths if use_paged_prefill else expanded_cache_seqlens
+        )
         graph_nsa_cache_seqlens.copy_(nsa_cache_seqlens)
         if graph_schedule_metadata is not None:
             build_paged_mqa_schedule_metadata(
@@ -1349,17 +1789,25 @@ def _run_prefill_or_verify_case(
     contiguous_k_nope = k_nope[pool_locs.to(torch.long)]
     contiguous_k_rope = k_rope[pool_locs.to(torch.long)]
     extend_kv_cache = pack_mla_kv_cache_reference(contiguous_k_nope, contiguous_k_rope)
-    extend_kv_fp8 = _make_extend_kv_fp8(
-        index_k_cache=index_k_cache,
-        real_page_table=base_real_page_table,
-        seq_lens=batch_cache_seqlens,
-        page_size=cfg.page_size,
+    extend_kv_fp8 = (
+        None
+        if use_paged_prefill
+        else _make_extend_kv_fp8(
+            index_k_cache=index_k_cache,
+            real_page_table=base_real_page_table,
+            seq_lens=batch_cache_seqlens,
+            page_size=cfg.page_size,
+        )
     )
     use_runtime_ragged_topk = (
         device.type == "cuda"
         and case.topk == 2048
         and _sgl_fast_topk_transform_ragged_fused is not None
     )
+    paged_prefill_plan = None
+
+    def map_indexer_topk(topk_indices: torch.Tensor) -> torch.Tensor:
+        return topk_indices
 
     if case.mode == "verify":
         base_candidate_page_table = make_dense_candidate_page_table(
@@ -1431,7 +1879,92 @@ def _run_prefill_or_verify_case(
         mla_k_rope = k_rope
         mla_metadata_mode = "target_verify"
         mla_workspace_mode = "verify"
+    elif use_paged_prefill:
+        paged_prefill_plan = plan_indexer_scratch(
+            B12XIndexerScratchCaps(
+                device=device,
+                source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+                num_q_heads=cfg.index_n_heads,
+                max_q_rows=case.total_q,
+                max_page_table_width=graph_real_page_table.shape[1],
+                topk=case.topk,
+                page_size=cfg.page_size,
+                mode="prefill",
+                shared_page_table=True,
+            )
+        )
+        paged_scratch = [
+            torch.empty(shape, dtype=dtype, device=device)
+            for shape, dtype in paged_prefill_plan.shapes_and_dtypes()
+        ]
+        paged_metadata = prepare_paged_indexer_metadata(
+            real_page_table=graph_real_page_table,
+            cache_seqlens_int32=graph_expanded_cache_seqlens,
+            expected_num_q_heads=cfg.index_n_heads,
+            build_schedule=False,
+            shared_page_table=True,
+        )
+        paged_binding = paged_prefill_plan.bind(
+            scratch=paged_scratch,
+            real_page_table=paged_metadata.real_page_table,
+            cache_seqlens_int32=paged_metadata.cache_seqlens_int32,
+            expected_num_q_heads=cfg.index_n_heads,
+            shared_page_table=True,
+            output_physical_slots=True,
+        )
+        paged_topk_indices = torch.empty(
+            (case.total_q, case.topk), dtype=torch.int32, device=device
+        )
+        paged_topk_scores = torch.empty(
+            (case.total_q, case.topk), dtype=torch.float32, device=device
+        )
+
+        def run_indexer():
+            return index_topk_fp8(
+                q_fp8=q_fp8,
+                weights=weights.squeeze(-1),
+                index_k_cache=index_k_cache,
+                binding=paged_binding,
+                topk=case.topk,
+                expected_num_q_heads=cfg.index_n_heads,
+                out_indices=paged_topk_indices,
+                out_scores=paged_topk_scores,
+            )
+
+        clear_indexer_caches()
+        actual_topk = run_indexer()
+        torch.cuda.synchronize()
+        expected_logical_topk = graph_expanded_cache_seqlens[:, None] - case.topk + torch.arange(
+            case.topk, dtype=torch.int32, device=device
+        )
+        expected_topk = _remap_logical_topk_to_physical(
+            logical_indices=expected_logical_topk,
+            real_page_table=graph_real_page_table,
+            physical_indices=torch.empty_like(expected_logical_topk),
+            page_size=cfg.page_size,
+        )
+        actual_topk_sorted = torch.sort(actual_topk, dim=1).values
+        expected_topk_sorted = torch.sort(expected_topk, dim=1).values
+        if not torch.equal(actual_topk_sorted, expected_topk_sorted):
+            mismatch = int(
+                (actual_topk_sorted != expected_topk_sorted).sum().item()
+            )
+            raise BenchmarkFailure(
+                case,
+                f"paged prefill topk mismatch: {mismatch} differing entries",
+            )
+        if not torch.isfinite(paged_topk_scores).all().item():
+            raise BenchmarkFailure(case, "paged prefill topk scores are non-finite")
+        mla_selected_indices = actual_topk
+        mla_kv_cache = kv_cache
+        mla_k_nope = k_nope
+        mla_k_rope = k_rope
+        mla_metadata_mode = "extend"
+        mla_workspace_mode = "extend"
+        preinitialize_indexer_logits = False
+        _use_tiled_output = True
     else:
+        assert extend_kv_fp8 is not None
         extend_indexer_metadata = IndexerContiguousMetadata(
             k_start=graph_contiguous_k_start,
             k_end=graph_contiguous_k_start + graph_contiguous_lengths,
@@ -1571,52 +2104,58 @@ def _run_prefill_or_verify_case(
         max_seq_len_k=aligned_graph_width,
         mode=mla_metadata_mode,
     )
-    mla_workspace = _make_mla_workspace(
+    mla_binding = _make_mla_binding(
         mode=mla_workspace_mode,
         cfg=cfg,
         device=device,
         topk=case.topk,
         max_total_q=case.total_q,
         max_batch=case.batch_size,
-    )
-    split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
-        kv_cache=mla_kv_cache,
-        page_table_1=mla_selected_indices,
-        output_dtype=q_all.dtype,
-        v_head_dim=cfg.kv_lora_rank,
+        selected_indices=mla_metadata.selected_token_offsets,
+        cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
     )
-    split_cfg = _apply_benchmark_mla_split_strategy(
-        split_cfg=split_cfg,
-        workspace_mode=mla_workspace_mode,
-        cache_seqlens=graph_batch_cache_seqlens,
-        device=device,
-        max_batch=case.batch_size,
-        q_rows=case.total_q,
-        topk_width=int(mla_selected_indices.shape[1]),
-    )
+    mla_workspace = mla_binding.scratch
+    # The integration planner routes every extend/verify binding through the
+    # single-pass SM120 prefill kernel. Keep the benchmark report aligned with
+    # that planner-owned serving route instead of reviving the legacy split
+    # path solely for component timing.
+    split_cfg = None
 
     def run_mla():
         return sparse_mla_extend_forward(
-            q_all=q_all,
             kv_cache=mla_kv_cache,
-            selected_token_offsets=mla_metadata.selected_token_offsets,
-            cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
-            workspace=mla_workspace,
+            binding=mla_binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
 
-    def run_step():
-        topk_indices = run_indexer()
-        return sparse_mla_extend_forward(
+    run_flashinfer_mla = None
+    flashinfer_output = None
+    if reference == "flashinfer":
+        run_flashinfer_mla, flashinfer_output = _make_flashinfer_sparse_mla_race(
             q_all=q_all,
             kv_cache=mla_kv_cache,
-            selected_token_offsets=topk_indices,
+            selected_indices=mla_selected_indices,
+            active_token_counts=graph_nsa_cache_seqlens,
+            sm_scale=cfg.sm_scale,
+            page_size=cfg.page_size,
+        )
+    elif reference != "none":
+        raise ValueError(f"unsupported MLA reference {reference!r}")
+
+    def run_step():
+        topk_indices = map_indexer_topk(run_indexer())
+        step_binding = mla_workspace.bind(
+            q=q_all,
+            selected_indices=topk_indices,
             cache_seqlens_int32=graph_batch_cache_seqlens,
             nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-            workspace=mla_workspace,
+        )
+        return sparse_mla_extend_forward(
+            kv_cache=mla_kv_cache,
+            binding=step_binding,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
@@ -1631,22 +2170,25 @@ def _run_prefill_or_verify_case(
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
+    if run_flashinfer_mla is not None:
+        run_flashinfer_mla()
     torch.cuda.synchronize()
     mla_sanity = _compare(actual_output, expected_output)
-    if mla_sanity.max_abs > MLA_MAX_ABS_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA max_abs {mla_sanity.max_abs:.6f} exceeded {MLA_MAX_ABS_TOL:.6f}",
+    _check_mla_sanity(case=case, label="MLA", metrics=mla_sanity)
+    flashinfer_mla_sanity = None
+    b12x_vs_flashinfer_sanity = None
+    if flashinfer_output is not None:
+        flashinfer_mla_sanity = _compare(flashinfer_output, expected_output)
+        _check_mla_sanity(
+            case=case,
+            label="FlashInfer MLA",
+            metrics=flashinfer_mla_sanity,
         )
-    if mla_sanity.rmse > MLA_RMSE_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA rmse {mla_sanity.rmse:.6f} exceeded {MLA_RMSE_TOL:.6f}",
-        )
-    if mla_sanity.cos < MLA_COS_TOL:
-        raise BenchmarkFailure(
-            case,
-            f"MLA cos {mla_sanity.cos:.6f} fell below {MLA_COS_TOL:.6f}",
+        b12x_vs_flashinfer_sanity = _compare(actual_output, flashinfer_output)
+        _check_mla_sanity(
+            case=case,
+            label="B12X vs FlashInfer MLA",
+            metrics=b12x_vs_flashinfer_sanity,
         )
     del actual_output
     del expected_output
@@ -1661,46 +2203,54 @@ def _run_prefill_or_verify_case(
     )
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
-    clear_indexer_caches()
-    indexer_logits_stats = _capture_and_bench_cuda_graph(
-        run_indexer_logits,
-        warmup=warmup,
-        replays=replays,
-        prepare=prepare_verify_graph,
-        l2_flush=l2_flush,
-    )
-    indexer_logits_us = statistics.median(indexer_logits_stats["replay_us"])
-
-    if case.mode == "verify":
-        def run_indexer_topk():
-            return _select_paged_topk_from_logits(
-                logits=logits_for_topk,
-                page_table_1=base_candidate_page_table,
-                seqlens=graph_expanded_cache_seqlens,
-                topk=case.topk,
-                cu_seqlens_q=cu_seqlens_q,
-                query_row_to_batch=query_row_to_batch,
-            )
-    elif _use_tiled_output:
-        def run_indexer_topk():
-            return _run_tiled_topk()
+    if use_paged_prefill:
+        # The production paged path is a streaming gather+score+top-k contract;
+        # its stages are intentionally not exposed as standalone benchmark APIs.
+        indexer_logits_us = 0.0
+        indexer_topk_us = 0.0
     else:
-        def run_indexer_topk():
-            return _select_ragged_topk_from_logits(
-                logits=logits_for_topk,
-                k_start=graph_contiguous_k_start,
-                lengths=graph_contiguous_lengths,
-                topk=case.topk,
-            )
+        clear_indexer_caches()
+        indexer_logits_stats = _capture_and_bench_cuda_graph(
+            run_indexer_logits,
+            warmup=warmup,
+            replays=replays,
+            prepare=prepare_verify_graph,
+            l2_flush=l2_flush,
+        )
+        indexer_logits_us = statistics.median(indexer_logits_stats["replay_us"])
 
-    indexer_topk_stats = _capture_and_bench_cuda_graph(
-        run_indexer_topk,
-        warmup=warmup,
-        replays=replays,
-        prepare=prepare_verify_graph,
-        l2_flush=l2_flush,
-    )
-    indexer_topk_us = statistics.median(indexer_topk_stats["replay_us"])
+        if case.mode == "verify":
+            def run_indexer_topk():
+                return _select_paged_topk_from_logits(
+                    logits=logits_for_topk,
+                    page_table_1=base_candidate_page_table,
+                    seqlens=graph_expanded_cache_seqlens,
+                    topk=case.topk,
+                    cu_seqlens_q=cu_seqlens_q,
+                    query_row_to_batch=query_row_to_batch,
+                )
+        elif _use_tiled_output:
+            def run_indexer_topk():
+                return _run_tiled_topk()
+        else:
+            def run_indexer_topk():
+                return _select_ragged_topk_from_logits(
+                    logits=logits_for_topk,
+                    k_start=graph_contiguous_k_start,
+                    lengths=graph_contiguous_lengths,
+                    topk=case.topk,
+                )
+
+        indexer_topk_stats = _capture_and_bench_cuda_graph(
+            run_indexer_topk,
+            warmup=warmup,
+            replays=replays,
+            prepare=prepare_verify_graph,
+            l2_flush=l2_flush,
+        )
+        indexer_topk_us = statistics.median(
+            indexer_topk_stats["replay_us"]
+        )
 
     clear_mla_caches()
     prepare_verify_graph()
@@ -1711,79 +2261,21 @@ def _run_prefill_or_verify_case(
         l2_flush=l2_flush,
     )
     mla_us = statistics.median(mla_stats["replay_us"])
+    flashinfer_mla_stats = None
+    flashinfer_mla_us = 0.0
+    if run_flashinfer_mla is not None:
+        prepare_verify_graph()
+        flashinfer_mla_stats = _capture_and_bench_cuda_graph(
+            run_flashinfer_mla,
+            warmup=warmup,
+            replays=replays,
+            l2_flush=l2_flush,
+        )
+        flashinfer_mla_us = statistics.median(
+            flashinfer_mla_stats["replay_us"]
+        )
     mla_forward_us = 0.0
     mla_merge_us = 0.0
-    if split_cfg is not None:
-        sm_scale_tensor = torch.empty((1,), dtype=torch.float32, device=device)
-        sm_scale_tensor[0] = cfg.sm_scale
-        if mla_workspace.tmp_output is None or mla_workspace.tmp_lse is None:
-            raise RuntimeError("workspace is missing split MLA buffers")
-        if mla_workspace.kv_chunk_size_ptr is None or mla_workspace.num_chunks_ptr is None:
-            raise RuntimeError("workspace is missing split MLA chunk pointers")
-        launch_num_chunks = (
-            mla_workspace.max_chunks_per_row
-            if (mla_workspace.fixed_capacity or mla_workspace.use_cuda_graph)
-            else split_cfg.num_chunks
-        )
-        split_output = torch.empty(
-            (q_all.shape[0], q_all.shape[1], cfg.kv_lora_rank),
-            dtype=q_all.dtype,
-            device=q_all.device,
-        )
-
-        def prepare_mla_components() -> None:
-            prepare_verify_graph()
-            mla_workspace.set_split_chunk_config(
-                kv_chunk_size=split_cfg.chunk_size,
-                num_chunks=split_cfg.num_chunks,
-            )
-
-        prepare_mla_components()
-
-        def run_mla_forward_component():
-            run_sparse_mla_split_decode_forward(
-                q_all=q_all,
-                kv_cache=mla_kv_cache,
-                page_table_1=mla_selected_indices,
-                active_token_counts=graph_nsa_cache_seqlens,
-                sm_scale=sm_scale_tensor,
-                kv_chunk_size_ptr=mla_workspace.kv_chunk_size_ptr,
-                num_chunks_ptr=mla_workspace.num_chunks_ptr,
-                tmp_output=mla_workspace.tmp_output,
-                tmp_lse=mla_workspace.tmp_lse,
-                launch_num_chunks=launch_num_chunks,
-                workspace=mla_workspace,
-            )
-
-        def run_mla_merge_component():
-            run_sparse_mla_split_decode_merge(
-                tmp_output=mla_workspace.tmp_output,
-                tmp_lse=mla_workspace.tmp_lse,
-                num_chunks_ptr=mla_workspace.num_chunks_ptr,
-                output=split_output,
-                workspace=mla_workspace,
-            )
-
-        run_mla_forward_component()
-        torch.cuda.synchronize()
-        mla_forward_stats = _capture_and_bench_cuda_graph(
-            run_mla_forward_component,
-            warmup=warmup,
-            replays=replays,
-            prepare=prepare_mla_components,
-            l2_flush=l2_flush,
-        )
-        mla_forward_us = statistics.median(mla_forward_stats["replay_us"])
-        run_mla_forward_component()
-        torch.cuda.synchronize()
-        mla_merge_stats = _capture_and_bench_cuda_graph(
-            run_mla_merge_component,
-            warmup=warmup,
-            replays=replays,
-            prepare=prepare_mla_components,
-            l2_flush=l2_flush,
-        )
-        mla_merge_us = statistics.median(mla_merge_stats["replay_us"])
 
     clear_indexer_caches()
     clear_mla_caches()
@@ -1795,7 +2287,11 @@ def _run_prefill_or_verify_case(
         l2_flush=l2_flush,
     )
     indexer_prefill_block_k = None
-    if case.mode == "prefill":
+    if use_paged_prefill:
+        assert paged_prefill_plan is not None
+        indexer_prefill_block_k = paged_prefill_plan.layout.prefill_block_k
+    elif case.mode == "prefill":
+        assert extend_kv_fp8 is not None
         indexer_prefill_block_k = resolve_contiguous_prefill_block_k(
             valid_q_rows=case.total_q,
             k_rows=int(extend_kv_fp8[0].shape[0]),
@@ -1805,22 +2301,48 @@ def _run_prefill_or_verify_case(
     return CaseReport(
         case=case,
         graph_width=graph_width,
+        cache_page_stride_bytes=cache_page_stride_bytes,
+        step_samples_us=tuple(
+            metadata_us + replay_us
+            for metadata_us, replay_us in zip(
+                step_stats["metadata_us"],
+                step_stats["replay_us"],
+                strict=True,
+            )
+        ),
+        mla_samples_us=tuple(mla_stats["replay_us"]),
+        flashinfer_mla_samples_us=(
+            ()
+            if flashinfer_mla_stats is None
+            else tuple(flashinfer_mla_stats["replay_us"])
+        ),
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
         indexer_logits_us=indexer_logits_us,
         indexer_topk_us=indexer_topk_us,
         mla_us=mla_us,
+        flashinfer_mla_us=flashinfer_mla_us,
         mla_forward_us=mla_forward_us,
         mla_merge_us=mla_merge_us,
         split_enabled=split_cfg is not None,
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
-        indexer_logits_fill=True if case.mode == "verify" else not skip_indexer_logits_fill,
+        indexer_logits_fill=(
+            True
+            if case.mode == "verify"
+            else False if use_paged_prefill else not skip_indexer_logits_fill
+        ),
         indexer_tiled_topk=_use_tiled_output if case.mode == "prefill" else False,
-        indexer_topk_path="tiled" if _use_tiled_output and case.mode == "prefill" else "scatter",
+        indexer_topk_path=(
+            "paged-streaming"
+            if use_paged_prefill
+            else "tiled" if _use_tiled_output and case.mode == "prefill" else "scatter"
+        ),
         indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
+        flashinfer_mla_sanity=flashinfer_mla_sanity,
+        b12x_vs_flashinfer_sanity=b12x_vs_flashinfer_sanity,
     )
 
 
@@ -1831,7 +2353,15 @@ def collect_case_reports(
 ) -> list[CaseReport]:
     if getattr(args, "nsa_prefill_block_k", None) is not None:
         os.environ[_NSA_PREFILL_BLOCK_K_ENV] = args.nsa_prefill_block_k
-    cfg = _load_glm_contract_config(tp_size=args.tp_size, tp_rank=args.tp_rank)
+    cfg = _load_glm_contract_config(
+        tp_size=args.tp_size,
+        tp_rank=args.tp_rank,
+        model_config=args.model_config,
+    )
+    cache_page_stride_bytes = _resolve_cache_page_stride_bytes(
+        args.cache_page_stride_bytes,
+        cfg,
+    )
     device = require_sm120() if device is None else device
     l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     cases = _build_decode_cases(
@@ -1856,9 +2386,11 @@ def collect_case_reports(
                 device=device,
                 pool_factor=args.pool_factor,
                 graph_width=args.graph_width,
+                cache_page_stride_bytes=cache_page_stride_bytes,
                 l2_flush=l2_flush,
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
                 decode_topk_backend=args.decode_topk_backend,
+                reference=args.reference,
             )
             if case.mode == "decode"
             else _run_prefill_or_verify_case(
@@ -1870,9 +2402,12 @@ def collect_case_reports(
                 device=device,
                 pool_factor=args.pool_factor,
                 graph_width=args.graph_width,
+                cache_page_stride_bytes=cache_page_stride_bytes,
                 l2_flush=l2_flush,
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
                 use_tiled_topk=args.use_tiled_topk,
+                prefill_indexer_layout=args.prefill_indexer_layout,
+                reference=args.reference,
             )
         )
         case_seed += 17
@@ -1892,10 +2427,36 @@ def _render_case_line(report: CaseReport) -> str:
         row_ctx_desc = (
             f" rowctx={min(report.case.decode_row_cache_lens):6d}-{report.case.cache_len:6d}"
         )
+    sanity_desc = ""
+    if report.mla_sanity is not None:
+        sanity_desc = (
+            f" mla_max_abs={report.mla_sanity.max_abs:.6g}"
+            f" mla_rmse={report.mla_sanity.rmse:.6g}"
+            f" mla_cos={report.mla_sanity.cos:.7f}"
+        )
+    reference_desc = ""
+    if report.flashinfer_mla_us > 0.0:
+        reference_desc = (
+            f" fi_mla={report.flashinfer_mla_us:8.2f} us"
+            f" b12x/fi={report.mla_ratio_vs_flashinfer:.3f}x"
+        )
+    if report.flashinfer_mla_sanity is not None:
+        reference_desc += (
+            f" fi_max_abs={report.flashinfer_mla_sanity.max_abs:.6g}"
+            f" fi_rmse={report.flashinfer_mla_sanity.rmse:.6g}"
+            f" fi_cos={report.flashinfer_mla_sanity.cos:.7f}"
+        )
+    if report.b12x_vs_flashinfer_sanity is not None:
+        reference_desc += (
+            f" b12x_fi_max_abs={report.b12x_vs_flashinfer_sanity.max_abs:.6g}"
+            f" b12x_fi_rmse={report.b12x_vs_flashinfer_sanity.rmse:.6g}"
+            f" b12x_fi_cos={report.b12x_vs_flashinfer_sanity.cos:.7f}"
+        )
     return (
-        f"glm51-{report.case.mode:6s} tp8 bs={report.case.batch_size:2d} "
+        f"glm52-{report.case.mode:6s} tp8 bs={report.case.batch_size:2d} "
         f"q={report.case.q_len:2d} ctx={report.case.cache_len:6d}{row_ctx_desc} "
-        f"graphw={report.graph_width:6d} topk={report.case.topk:4d} split={split_flag:>3s} "
+        f"graphw={report.graph_width:6d} cache_stride={report.cache_page_stride_bytes:d} "
+        f"topk={report.case.topk:4d} split={split_flag:>3s} "
         f"chunk={report.chunk_size:3d} nchunks={report.num_chunks:d} | "
         f"step={report.total_us:8.2f} us | "
         f"total={report.total_us:8.2f} us | "
@@ -1910,6 +2471,8 @@ def _render_case_line(report: CaseReport) -> str:
         f"idx_bk={idx_bk} "
         f"idx_init={fill_flag} "
         f"idx_topk_path={topk_path}"
+        f"{sanity_desc}"
+        f"{reference_desc}"
     )
 
 
@@ -1923,7 +2486,7 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
     mla_geo = _geomean([report.mla_us for report in reports])
     mla_forward_geo = _geomean([report.mla_forward_us for report in reports])
     mla_merge_geo = _geomean([report.mla_merge_us for report in reports])
-    return [
+    lines = [
         "Summary",
         f"  cases: {len(reports)}",
         f"  total geo:   {total_geo:.2f} us",
@@ -1937,18 +2500,58 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
         f"  mla fwd:     {mla_forward_geo:.2f} us",
         f"  mla merge:   {mla_merge_geo:.2f} us",
     ]
+    reference_reports = [
+        report for report in reports if report.flashinfer_mla_us > 0.0
+    ]
+    if reference_reports:
+        flashinfer_geo = _geomean(
+            [report.flashinfer_mla_us for report in reference_reports]
+        )
+        ratio_geo = _geomean(
+            [report.mla_ratio_vs_flashinfer for report in reference_reports]
+        )
+        lines.extend(
+            [
+                f"  flashinfer:  {flashinfer_geo:.2f} us",
+                f"  b12x/fi:     {ratio_geo:.3f}x (<1 means b12x faster)",
+            ]
+        )
+    return lines
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--preset",
-        choices=("none", TARGET_PREFILL64K_BS1_PRESET),
+        choices=(
+            "none",
+            TARGET_PREFILL64K_BS1_PRESET,
+            TARGET_GLM52_PREFILL4K_CTX16K_PRESET,
+            TARGET_DSV4_TRACE_PRESET,
+        ),
         default="none",
         help=(
-            "shape preset; target-prefill64k-bs1 maps to "
-            "--modes prefill --batch-sizes 1 --cache-lens 65536 "
-            "--verify-q-lens 2048 --topk-cap 2048 --graph-width 65536"
+            "shape preset; target-glm52-prefill4k-ctx16k maps to a vLLM-oriented "
+            "TP8 4096-token chunk at 16k context with top-k 2048 and tiled top-k; "
+            "target-dsv4-trace runs the TP2 C1/C4/C128 compressed-MLA trace race"
+        ),
+    )
+    parser.add_argument(
+        "--model-config",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Hugging Face config.json override; by default resolve "
+            f"{DEFAULT_GLM52_HF_REPO_ID} from the local Hugging Face cache"
+        ),
+    )
+    parser.add_argument(
+        "--reference",
+        choices=("none", "flashinfer"),
+        default="none",
+        help=(
+            "optional sparse-MLA kernel race; flashinfer requires FlashInfer "
+            "main with the SM120 GLM sparse kernels"
         ),
     )
     parser.add_argument(
@@ -1995,6 +2598,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tp-rank", type=int, default=DEFAULT_TP_RANK)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--replays", type=int, default=200)
+    parser.add_argument(
+        "--print-raw-samples",
+        action="store_true",
+        help="print every step, b12x MLA, and reference MLA replay sample",
+    )
     parser.add_argument("--seed", type=int, default=70_000)
     parser.add_argument("--pool-factor", type=int, default=DEFAULT_POOL_FACTOR)
     parser.add_argument(
@@ -2032,6 +2640,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="benchmark prefill with tiled indexer output consumed directly by the CuTe topk kernel.",
     )
     parser.add_argument(
+        "--prefill-indexer-layout",
+        choices=("contiguous", "paged"),
+        default="contiguous",
+        help=(
+            "prefill indexer source layout; paged matches vLLM's shared-page-table "
+            "production route"
+        ),
+    )
+    parser.add_argument(
+        "--cache-page-stride-bytes",
+        type=int,
+        default=None,
+        help=(
+            "physical stride between pages of one vLLM cache view; 0 keeps "
+            "the normal per-layer contiguous GLM layout, while -1 derives an "
+            "aggregate all-layer stride for packed-layout regression testing"
+        ),
+    )
+    parser.add_argument(
         "--nsa-prefill-block-k",
         choices=("auto", "256", "512"),
         default=None,
@@ -2045,6 +2672,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.preset == TARGET_DSV4_TRACE_PRESET:
+        from benchmarks.benchmark_compressed_mla import main as compressed_mla_main
+
+        forwarded = [
+            "--preset",
+            "vllm-dsv4-trace",
+            "--warmup",
+            str(args.warmup),
+            "--replays",
+            str(args.replays),
+            "--seed",
+            str(args.seed),
+            "--l2-flush-bytes",
+            str(args.l2_flush_bytes),
+        ]
+        if not args.flush_l2:
+            forwarded.append("--no-flush-l2")
+        if args.print_raw_samples:
+            forwarded.append("--print-raw-samples")
+        if args.model_config is not None:
+            forwarded.extend(("--model-config", str(args.model_config)))
+        return compressed_mla_main(forwarded)
+
     device = require_sm120()
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
     flush_desc = (
@@ -2053,6 +2703,18 @@ def main(argv: list[str] | None = None) -> int:
         else "off"
     )
     print(f"L2 flush: {flush_desc}")
+    if args.reference == "flashinfer":
+        try:
+            flashinfer_version, flashinfer_revision = (
+                _flashinfer_reference_identity()
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(
+            "FlashInfer reference: "
+            f"version={flashinfer_version} commit={flashinfer_revision}"
+        )
     try:
         reports = collect_case_reports(args, device=device)
     except BenchmarkFailure as exc:
@@ -2061,6 +2723,19 @@ def main(argv: list[str] | None = None) -> int:
 
     for report in reports:
         print(_render_case_line(report))
+        if args.print_raw_samples:
+            raw_us = ",".join(f"{sample:.2f}" for sample in report.step_samples_us)
+            print(f"  step_raw_us=[{raw_us}]")
+            mla_raw_us = ",".join(
+                f"{sample:.2f}" for sample in report.mla_samples_us
+            )
+            print(f"  mla_raw_us=[{mla_raw_us}]")
+            if report.flashinfer_mla_samples_us:
+                flashinfer_raw_us = ",".join(
+                    f"{sample:.2f}"
+                    for sample in report.flashinfer_mla_samples_us
+                )
+                print(f"  flashinfer_mla_raw_us=[{flashinfer_raw_us}]")
     for line in _render_summary_lines(reports):
         print(line)
     return 0

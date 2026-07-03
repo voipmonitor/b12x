@@ -797,6 +797,10 @@ class W4A16GemmKernel:
             self.cta_m_blocks,
             self.uses_m_block_8,
             self.shared_words,
+            # Launch bounds are part of the compiled kernel.  Keep binaries
+            # planned for different residency targets out of the same cache
+            # entry even when their arithmetic geometry otherwise matches.
+            self.blocks_per_sm,
         )
 
     @cute.jit
@@ -947,6 +951,7 @@ class W4A16GemmKernel:
         ).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
             stream=stream,
         )
 
@@ -3656,6 +3661,7 @@ class W4A16FusedMoeKernel:
             self.cta_threads,
             self.sms,
             self.shared_words,
+            self.blocks_per_sm,
         )
 
     @cute.jit
@@ -3742,6 +3748,7 @@ class W4A16FusedMoeKernel:
         ).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
             stream=stream,
         )
 
@@ -4498,7 +4505,7 @@ def _compile_w4a16_small_m_direct(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cute.compile(
+    compiled = b12x_compile(
         kernel,
         dummy(cutlass.BFloat16),
         dummy(cutlass.Uint8),
@@ -4518,6 +4525,25 @@ def _compile_w4a16_small_m_direct(
         Int32(m),
         Int32(kernel.grid_x),
         current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_facts(
+            "moe.w4a16.small_m_direct",
+            1,
+            ("device_index", None if device is None else int(device.index or 0)),
+            ("m", int(m)),
+            ("hidden_size", int(hidden_size)),
+            ("intermediate_size", int(intermediate_size)),
+            ("num_experts", int(num_experts)),
+            ("topk", int(topk)),
+            ("activation", activation),
+            ("fast_math", bool(fast_math)),
+            ("topk_ids_dtype", str(topk_ids_dtype)),
+            ("scale_format", scale_format),
+            ("swiglu_limit", swiglu_limit),
+            ("swiglu_alpha", swiglu_alpha),
+            ("swiglu_beta", swiglu_beta),
+            ("w13_layout", w13_layout),
+            ("grid_x", int(kernel.grid_x)),
+        ),
     )
     launch = _W4A16SmallMDirectLaunch(
         compiled=compiled,

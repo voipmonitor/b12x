@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
 import torch
 
 import b12x.attention.indexer.api as indexer_impl
@@ -227,6 +228,110 @@ def test_indexer_common_plan_chooses_layout_from_source_contract() -> None:
     assert paged_plan.layout.route in {"paged_tiled", "paged_fused"}
     assert contiguous_plan.source_layout == INDEXER_SOURCE_LAYOUT_CONTIGUOUS
     assert contiguous_plan.layout.max_k_rows == 1024
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
+def test_indexer_common_plan_selects_tiled_for_c4_decode_buckets(rows) -> None:
+    # C4 decode is owned by the streamed tiled route + two-level fold; the
+    # fused kernel is retired from this shape (kept for MSA/contiguous and as
+    # an explicit opt-in).
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=64,
+            max_q_rows=rows,
+            max_page_table_width=4160,
+            topk=512,
+            mode="decode",
+        )
+    )
+
+    assert plan.layout.route == "paged_tiled"
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
+def test_indexer_common_plan_selects_measured_glm_decode_routes(rows) -> None:
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=32,
+            max_q_rows=rows,
+            max_page_table_width=256,
+            topk=2048,
+            mode="decode",
+        )
+    )
+
+    # GLM keeps fused through rows 16; rows >= 32 measured faster on the
+    # streamed tiled route at every capacity bucket.
+    expected = "paged_fused" if rows <= 16 else "paged_tiled"
+    assert plan.layout.route == expected
+
+
+@pytest.mark.parametrize("rows", [1024, 2048, 4096, 8192])
+def test_indexer_common_plan_selects_bk512_for_c4_prefill_buckets(rows) -> None:
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=64,
+            max_q_rows=rows,
+            max_page_table_width=4160,
+            topk=512,
+            mode="prefill",
+            shared_page_table=True,
+        )
+    )
+
+    assert plan.layout.route == "packed_contiguous"
+    assert plan.layout.prefill_block_k == 512
+
+
+@pytest.mark.parametrize("rows", [1024, 2048, 4096, 8192])
+def test_indexer_common_plan_selects_bk512_for_glm_prefill_buckets(rows) -> None:
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
+            device="cpu",
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+            num_q_heads=32,
+            max_q_rows=rows,
+            max_page_table_width=256,
+            topk=2048,
+            mode="prefill",
+            shared_page_table=True,
+        )
+    )
+
+    assert plan.layout.route == "packed_contiguous"
+    assert plan.layout.prefill_block_k == 512
+
+
+def test_indexer_paged_default_supertile_is_capped_by_fixed_capacity(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("B12X_PAGED_INDEX_SUPERTILE_K", raising=False)
+    common = dict(
+        device="cpu",
+        source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+        num_q_heads=32,
+        max_q_rows=4096,
+        max_page_table_width=256,
+        topk=2048,
+        mode="prefill",
+        shared_page_table=True,
+    )
+    automatic = plan_indexer_scratch(B12XIndexerScratchCaps(**common))
+    explicit = plan_indexer_scratch(
+        B12XIndexerScratchCaps(**common, supertile_k=32768)
+    )
+
+    assert automatic.layout.supertile_tokens == 16384
+    assert automatic.layout.gather_k_rows == 16384
+    assert explicit.layout.supertile_tokens == 32768
+    assert explicit.layout.gather_k_rows == 32768
+    assert automatic.layout.nbytes < explicit.layout.nbytes
 
 
 def test_indexer_common_packed_scratch_sizes_from_indexer_k_rows() -> None:

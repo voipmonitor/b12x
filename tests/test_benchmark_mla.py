@@ -1,8 +1,27 @@
 from __future__ import annotations
 
+import json
+
 import torch
 
 from benchmarks import benchmark_mla
+
+
+_GLM52_TEST_CONFIG = {
+    "num_hidden_layers": 78,
+    "num_attention_heads": 64,
+    "index_n_heads": 32,
+    "index_head_dim": 128,
+    "index_topk": 2048,
+    "qk_nope_head_dim": 192,
+    "qk_rope_head_dim": 64,
+    "kv_lora_rank": 512,
+}
+
+
+def _write_glm52_config(path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_GLM52_TEST_CONFIG))
 
 
 def test_build_decode_cases_covers_requested_matrix_and_topk_cap() -> None:
@@ -85,6 +104,86 @@ def test_target_prefill64k_bs1_preset_sets_target_shape() -> None:
     assert args.graph_width == 65536
 
 
+def test_target_glm52_prefill4k_ctx16k_preset_sets_target_shape() -> None:
+    args = benchmark_mla._parse_args(
+        ["--preset", benchmark_mla.TARGET_GLM52_PREFILL4K_CTX16K_PRESET]
+    )
+
+    assert args.modes == "prefill"
+    assert args.batch_sizes == "1"
+    assert args.cache_lens == "16384"
+    assert args.verify_q_lens == "4096"
+    assert args.topk_cap == 2048
+    assert args.graph_width == 16384
+    assert args.use_tiled_topk
+    assert args.prefill_indexer_layout == "paged"
+    assert args.cache_page_stride_bytes == 0
+
+
+def test_flashinfer_reference_is_opt_in() -> None:
+    assert benchmark_mla._parse_args([]).reference == "none"
+    assert (
+        benchmark_mla._parse_args(["--reference", "flashinfer"]).reference
+        == "flashinfer"
+    )
+
+
+def test_flashinfer_paged_kv_view_is_zero_copy() -> None:
+    cache = torch.empty((128, 1, 656), dtype=torch.uint8)
+
+    paged = benchmark_mla._flashinfer_paged_kv_view(cache, page_size=64)
+
+    assert paged.shape == (2, 64, 656)
+    assert paged.data_ptr() == cache.data_ptr()
+
+
+def test_target_glm52_preset_preserves_explicit_packed_stride_regression() -> None:
+    args = benchmark_mla._parse_args(
+        [
+            "--preset",
+            benchmark_mla.TARGET_GLM52_PREFILL4K_CTX16K_PRESET,
+            "--cache-page-stride-bytes",
+            "-1",
+        ]
+    )
+
+    assert args.cache_page_stride_bytes == -1
+
+
+def test_resolve_cached_hf_config_follows_main_ref(tmp_path) -> None:
+    repo_cache = tmp_path / "models--lukealonso--GLM-5.2-NVFP4"
+    revision = "test-revision"
+    config_path = repo_cache / "snapshots" / revision / "config.json"
+    _write_glm52_config(config_path)
+    main_ref = repo_cache / "refs" / "main"
+    main_ref.parent.mkdir(parents=True)
+    main_ref.write_text(revision)
+
+    resolved = benchmark_mla._resolve_cached_hf_config(cache_root=tmp_path)
+
+    assert resolved == config_path
+
+
+def test_glm52_all_layer_cache_bytes_match_cached_config(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    _write_glm52_config(config_path)
+    monkeypatch.setattr(
+        benchmark_mla,
+        "_resolve_cached_hf_config",
+        lambda: config_path,
+    )
+
+    cfg = benchmark_mla._load_glm_contract_config(tp_size=8, tp_rank=0)
+
+    assert cfg.index_cache_page_bytes == 8_448
+    assert cfg.mla_cache_page_bytes == 41_984
+    assert cfg.all_layer_cache_block_bytes == 3_933_696
+    assert benchmark_mla._resolve_cache_page_stride_bytes(-1, cfg) == 3_933_696
+
+
 def test_render_case_line_reports_public_step_metrics() -> None:
     report = benchmark_mla.CaseReport(
         case=benchmark_mla.DecodeCase(mode="prefill", batch_size=4, cache_len=32768, topk=2048, q_len=16384),
@@ -101,7 +200,7 @@ def test_render_case_line_reports_public_step_metrics() -> None:
 
     line = benchmark_mla._render_case_line(report)
 
-    assert "glm51-prefill tp8" in line
+    assert "glm52-prefill tp8" in line
     assert "bs= 4" in line
     assert "q=16384" in line
     assert "ctx= 32768" in line
@@ -116,6 +215,42 @@ def test_render_case_line_reports_public_step_metrics() -> None:
     assert "indexer=" in line
     assert "mla=" in line
     assert "idx_bk=decode" in line
+
+
+def test_render_case_line_reports_flashinfer_race_and_correctness() -> None:
+    report = benchmark_mla.CaseReport(
+        case=benchmark_mla.DecodeCase(
+            mode="prefill",
+            batch_size=1,
+            cache_len=16384,
+            topk=2048,
+            q_len=4096,
+        ),
+        mla_us=200.0,
+        flashinfer_mla_us=250.0,
+        mla_sanity=benchmark_mla.SanityMetrics(
+            max_abs=0.01,
+            rmse=0.001,
+            cos=0.9999,
+        ),
+        flashinfer_mla_sanity=benchmark_mla.SanityMetrics(
+            max_abs=0.02,
+            rmse=0.002,
+            cos=0.9998,
+        ),
+        b12x_vs_flashinfer_sanity=benchmark_mla.SanityMetrics(
+            max_abs=0.02,
+            rmse=0.002,
+            cos=0.9998,
+        ),
+    )
+
+    line = benchmark_mla._render_case_line(report)
+
+    assert "fi_mla=  250.00 us" in line
+    assert "b12x/fi=0.800x" in line
+    assert "fi_cos=0.9998000" in line
+    assert "b12x_fi_cos=0.9998000" in line
 
 
 def test_render_case_line_reports_heterogeneous_decode_context_range() -> None:
@@ -140,7 +275,7 @@ def test_render_case_line_reports_heterogeneous_decode_context_range() -> None:
 
     line = benchmark_mla._render_case_line(report)
 
-    assert "glm51-decode tp8" in line
+    assert "glm52-decode tp8" in line
     assert "ctx=131072" in line
     assert "rowctx= 32768-131072" in line
 
@@ -185,6 +320,25 @@ def test_render_summary_lines_reports_geomeans() -> None:
     assert lines[7] == "  replay geo:  200.00 us"
 
 
+def test_render_summary_lines_reports_flashinfer_ratio_direction() -> None:
+    report = benchmark_mla.CaseReport(
+        case=benchmark_mla.DecodeCase(
+            mode="prefill",
+            batch_size=1,
+            cache_len=16384,
+            topk=2048,
+            q_len=4096,
+        ),
+        mla_us=200.0,
+        flashinfer_mla_us=250.0,
+    )
+
+    lines = benchmark_mla._render_summary_lines([report])
+
+    assert "  flashinfer:  250.00 us" in lines
+    assert "  b12x/fi:     0.800x (<1 means b12x faster)" in lines
+
+
 def test_main_prints_no_stdout_on_failure(monkeypatch, capsys) -> None:
     case = benchmark_mla.DecodeCase(mode="decode", batch_size=1, cache_len=1024, topk=1024)
 
@@ -198,7 +352,7 @@ def test_main_prints_no_stdout_on_failure(monkeypatch, capsys) -> None:
 
     captured = capsys.readouterr()
     assert rc == 1
-    assert "glm51-" not in captured.out
+    assert "glm52-" not in captured.out
     assert "Summary" not in captured.out
     assert "synthetic failure" in captured.err
 
@@ -227,7 +381,7 @@ def test_main_prints_buffered_case_lines_and_summary(monkeypatch, capsys) -> Non
 
     captured = capsys.readouterr()
     assert rc == 0
-    assert "glm51-prefill tp8" in captured.out
+    assert "glm52-prefill tp8" in captured.out
     assert "Summary" in captured.out
     assert captured.err == ""
 

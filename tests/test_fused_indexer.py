@@ -12,11 +12,96 @@ import pytest
 import torch
 
 from b12x.attention.indexer.fused_indexer import (
+    KV_LAYOUT_CONTIGUOUS_MLA,
+    KV_LAYOUT_PAGED,
+    _BATCH_SLACK,
+    _COOP_STATE_WORDS,
+    _DSV4_BATCH_SLACK,
+    _resolve_fused_batch_slack,
+    fused_indexer_scratch_capacity,
+    resolve_fused_indexer_path,
     run_fused_paged_indexer,
     run_fused_indexer_mla,
 )
 
 _PS = 64  # compressed-index page size
+
+
+def test_paged_dsv4_always_uses_large_fused_carry():
+    assert _resolve_fused_batch_slack(
+        kv_layout=KV_LAYOUT_PAGED,
+        num_heads=64,
+        topk=512,
+    ) == _DSV4_BATCH_SLACK
+
+
+@pytest.mark.parametrize(
+    "kv_layout,num_heads,topk",
+    [
+        (KV_LAYOUT_CONTIGUOUS_MLA, 64, 512),
+        (KV_LAYOUT_PAGED, 32, 2048),
+        (KV_LAYOUT_PAGED, 16, 512),
+    ],
+)
+def test_large_fused_carry_is_paged_dsv4_specific(kv_layout, num_heads, topk):
+    assert _resolve_fused_batch_slack(
+        kv_layout=kv_layout,
+        num_heads=num_heads,
+        topk=topk,
+    ) == _BATCH_SLACK
+
+
+@pytest.mark.parametrize("width", [8192, 16384, 32768, 131072])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+def test_fused_indexer_route_covers_glm_decode_buckets(width, rows):
+    assert resolve_fused_indexer_path(
+        topk=2048,
+        num_rows=rows,
+        width=width,
+        num_heads=32,
+    )
+
+
+@pytest.mark.parametrize("rows", [32, 64])
+def test_fused_indexer_route_stops_after_glm_decode_buckets(rows):
+    # Rows >= 32 belong to the streamed tiled route: measured wins at every
+    # capacity bucket (e.g. r64@131K 1043us tiled vs 1541us fused).
+    assert not resolve_fused_indexer_path(
+        topk=2048,
+        num_rows=rows,
+        width=16384,
+        num_heads=32,
+    )
+
+
+def test_fused_indexer_route_keeps_generic_head_count_limit():
+    assert not resolve_fused_indexer_path(
+        topk=2048,
+        num_rows=8,
+        width=16384,
+        num_heads=64,
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])
+def test_fused_indexer_route_retired_for_c4_decode_buckets(rows):
+    # C4 decode is owned by the streamed tiled route + two-level fold; fused
+    # remains only for MSA/contiguous and explicit opt-in.
+    assert not resolve_fused_indexer_path(
+        topk=512,
+        num_rows=rows,
+        width=4160 * 64,
+        num_heads=64,
+    )
+
+
+def test_fused_indexer_route_stops_after_c4_decode_buckets():
+    assert not resolve_fused_indexer_path(
+        topk=512,
+        num_rows=65,
+        width=4160 * 64,
+        num_heads=64,
+    )
 
 
 def _build_case(rows, heads, seqlen, topk, *, seed, device):
@@ -84,6 +169,44 @@ def test_fused_indexer_paged_matches_reference(topk, rows, seqlen, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_indexer_paged_emits_native_physical_slots():
+    device = torch.device("cuda")
+    rows, heads, topk, seqlen = 2, 16, 512, 1024
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
+        rows, heads, seqlen, topk, seed=71, device=device
+    )
+    page_table = torch.flip(page_table, dims=(1,)).contiguous()
+    idx, val = run_fused_paged_indexer(
+        q_bytes=q_fp8.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+        output_physical_slots=True,
+    )
+    torch.cuda.synchronize(device)
+    gold_vals, gold_idx_sets = _golden_topk(
+        q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk
+    )
+    assert torch.allclose(
+        torch.sort(val, dim=1, descending=True).values,
+        gold_vals,
+        atol=1e-2,
+        rtol=0,
+    )
+    for row in range(rows):
+        logical = torch.tensor(
+            sorted(gold_idx_sets[row]), dtype=torch.int64, device=device
+        )
+        page_ids = page_table[row, torch.div(logical, _PS, rounding_mode="floor")]
+        physical = page_ids * _PS + torch.remainder(logical, _PS)
+        assert set(idx[row].tolist()) == set(physical.tolist())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
 @pytest.mark.parametrize("seqlen", [4101, 8255, 5377])
 def test_fused_indexer_paged_partial_last_page(seqlen):
     # seqlen % 64 != 0 -> the last page is partial (valid_slots < 64). Exercises
@@ -135,6 +258,40 @@ def test_fused_indexer_paged_short_context_no_radix():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_indexer_paged_strided_q_scalar_load_fallback():
+    device = torch.device("cuda")
+    rows, heads, topk, seqlen = 2, 16, 512, 1024
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
+        rows, heads, seqlen, topk, seed=17, device=device
+    )
+    padded_q = torch.empty(
+        (rows, heads, 129), dtype=torch.float8_e4m3fn, device=device
+    )
+    padded_q[..., :128].copy_(q_fp8)
+    strided_q = padded_q[..., :128]
+    assert strided_q.stride(1) == 129
+
+    idx, val = run_fused_paged_indexer(
+        q_bytes=strided_q.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+    )
+    torch.cuda.synchronize(device)
+    gold_vals, gold_idx_sets = _golden_topk(
+        strided_q, weights, k_fp8, k_scales, page_table, seqlens, topk
+    )
+    fused_sorted = torch.sort(val, dim=1, descending=True).values
+    assert torch.allclose(fused_sorted, gold_vals, atol=1e-2, rtol=0)
+    for row in range(rows):
+        assert set(idx[row].tolist()) == gold_idx_sets[row]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
 @pytest.mark.parametrize("ctas_per_group", [96, 188])
 def test_fused_indexer_paged_long_context_merge_exact(ctas_per_group):
     # Long context + many CTAs stresses the in-kernel last-CTA merge: each CTA's
@@ -164,6 +321,68 @@ def test_fused_indexer_paged_long_context_merge_exact(ctas_per_group):
     assert torch.allclose(fused_sorted, gold_vals, atol=1e-2, rtol=0)
     for r in range(rows):
         assert set(idx[r].tolist()) == gold_idx_sets[r]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_indexer_preinitialized_state_graph_replay_switches_merge_mode():
+    """One initialized workspace remains exact across serial/coop graph replays."""
+    device = torch.device("cuda")
+    rows, heads, topk, max_seqlen = 2, 32, 512, 4097
+    ctas_per_group = 8
+    merge_threshold = 3000
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
+        rows, heads, max_seqlen, topk, seed=41, device=device
+    )
+    pack_capacity, _ = fused_indexer_scratch_capacity(
+        rows, topk, torch.cuda.get_device_properties(device).multi_processor_count
+    )
+    pack_values = torch.empty(pack_capacity, dtype=torch.float32, device=device)
+    pack_indices = torch.empty(pack_capacity, dtype=torch.int32, device=device)
+    merge_state = torch.zeros(
+        rows * _COOP_STATE_WORDS, dtype=torch.int32, device=device
+    )
+    out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    out_values = torch.empty((rows, topk), dtype=torch.float32, device=device)
+
+    kwargs = dict(
+        q_bytes=q_fp8.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+        out_indices=out_indices,
+        out_values=out_values,
+        ctas_per_group=ctas_per_group,
+        merge_threshold=merge_threshold,
+        pack_values=pack_values,
+        pack_indices=pack_indices,
+        merge_state=merge_state,
+        merge_state_preinitialized=True,
+    )
+    # Compile and exercise one launch before capture. The kernel must restore
+    # its counters; no memset is part of the captured graph below.
+    run_fused_paged_indexer(**kwargs)
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_fused_paged_indexer(**kwargs)
+
+    # Alternate across the runtime dispatch boundary and repeat both arms. This
+    # catches stale arrival/output/total/cleanup counters on graph replay.
+    for live_seqlen in (2048, max_seqlen, max_seqlen, 2048, max_seqlen):
+        seqlens.fill_(live_seqlen)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        gold_values, gold_idx_sets = _golden_topk(
+            q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk
+        )
+        fused_sorted = torch.sort(out_values, dim=1, descending=True).values
+        assert torch.allclose(fused_sorted, gold_values, atol=1e-2, rtol=0)
+        for row in range(rows):
+            assert set(out_indices[row].tolist()) == gold_idx_sets[row]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")

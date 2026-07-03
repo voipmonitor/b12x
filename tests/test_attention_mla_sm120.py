@@ -31,6 +31,7 @@ if _SM120PORT not in sys.path:
     sys.path.insert(0, _SM120PORT)
 import dsv4_ref  # noqa: E402
 import dsv4_extra_ref  # noqa: E402
+import prefill_ref  # noqa: E402
 import glm_ref  # noqa: E402
 
 import b12x.attention.mla.api as mla_api
@@ -63,6 +64,61 @@ _GLM_V_HEAD_DIM = 512
 _GLM_KV_BYTES_PER_TOKEN = 656
 _NUM_Q_HEADS = 8
 _SM_SCALE = 1.0 / math.sqrt(_GLM_Q_HEAD_DIM)
+
+
+def test_cache_block_stride_distinguishes_flat_contiguous_and_packed_views() -> None:
+    from b12x.attention.mla import kernel as decode_kernel
+    from b12x.attention.mla import prefill as prefill_dispatch
+    from b12x.attention.mla import prefill_mg
+    from b12x.attention.mla.traits import ModelType
+
+    page_size = 64
+    payload = page_size * _GLM_KV_BYTES_PER_TOKEN
+    # This is the token-major rank-3 shape used by the GLM reference and
+    # benchmark. Its stride(0) is one token, not one physical cache block.
+    contiguous = torch.empty(
+        (2 * page_size, 1, _GLM_KV_BYTES_PER_TOKEN), dtype=torch.uint8
+    )
+    physical_stride = payload + 256
+    packed_storage = torch.empty((2, physical_stride), dtype=torch.uint8)
+    packed_view = packed_storage[:, :payload]
+    packed_rank3 = torch.as_strided(
+        packed_storage,
+        size=(2, page_size, _GLM_KV_BYTES_PER_TOKEN),
+        stride=(physical_stride, _GLM_KV_BYTES_PER_TOKEN, 1),
+    )
+    assert contiguous.is_contiguous()
+    assert not packed_view.is_contiguous()
+    assert not packed_rank3.is_contiguous()
+    assert mla_api._is_supported_packed_kv_cache_view(
+        packed_rank3,
+        page_size=page_size,
+    )
+
+    helpers = (
+        lambda cache: decode_kernel._cache_block_stride_bytes(
+            cache,
+            page_size=page_size,
+            model_type=int(ModelType.GLM_NSA),
+        ),
+        lambda cache: prefill_dispatch._cache_block_stride_bytes(
+            cache,
+            page_size=page_size,
+            model_type=ModelType.GLM_NSA,
+        ),
+        lambda cache: prefill_mg._cache_block_stride_bytes(
+            cache,
+            page_size=page_size,
+            is_glm=True,
+        ),
+    )
+    for resolve in helpers:
+        assert resolve(contiguous) == payload
+        assert resolve(packed_view) == physical_stride
+
+    expected_span = physical_stride + payload
+    assert decode_kernel._cache_base_tensor(packed_rank3).numel() == expected_span
+    assert prefill_mg._cache_base_tensor(packed_rank3).numel() == expected_span
 
 
 def sparse_mla_decode_forward(*, workspace=None, q_all=None, page_table_1=None, cache_seqlens_int32=None, nsa_cache_seqlens_int32=None, **kwargs):
@@ -427,7 +483,7 @@ def test_glm_decode_mode_still_routes_to_unified_decode(monkeypatch) -> None:
 
 
 # ── DSV4 MAIN-CACHE compressed decode (P7): real kernel + split-K + merge ──────
-_DSV4_HEADS = 32          # local q heads (2 head blocks of HPB=16)
+_DSV4_HEADS = 32          # local q heads (4 native head blocks of HPB=8)
 _DSV4_HEAD_DIM = 512
 _DSV4_PAGE = 64           # compressed page_size for the test cache
 _DSV4_SM_SCALE = 1.0 / math.sqrt(_DSV4_HEAD_DIM)
@@ -483,6 +539,18 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
     )
     torch.cuda.synchronize()
     assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
+
+    import b12x.attention.mla.kernel as launch
+
+    plan = launch.LAST_DECODE_PLAN
+    assert plan.get("native_dsv4_h8") is True
+    assert plan.get("heads_per_block") == 8
+    assert plan.get("math_warps") == 4
+    assert plan.get("block_threads") == 160
+    assert plan.get("kv_stage_packed") is True
+    assert plan.get("kv_smem_stride") == 592
+    assert plan.get("qk_candidates_per_warp") == 16
+    assert plan.get("qk_swap_ab") is True
 
     exp = compressed_sparse_mla_reference(
         q, cache, idx, lengths, sm_scale=_DSV4_SM_SCALE, swa_page_size=_DSV4_PAGE
@@ -975,6 +1043,133 @@ def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> N
 
 
 @torch.inference_mode()
+def test_unified_prefill_dsv4_valid_hpb_8_matches_prefill_ref() -> None:
+    """DSV4 prefill heads=8 uses a single MG group with VALID_HPB=8 and must not
+    read or reduce the zero-padded upper half of the HPB=16 tile."""
+    device = require_sm120_sparse_mla()
+    from b12x.attention.mla.kernel import run_unified_prefill
+
+    num_tokens, num_heads, topk = 16, 8, 128
+    num_blocks = 8
+    case = prefill_ref.make_dsv4_prefill_case(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        num_blocks=num_blocks,
+        page_block_size=_DSV4_PAGE,
+        with_sink=False,
+        invalidate_half=True,
+        device=device,
+        seed=8128,
+    )
+    q = case["q"].contiguous()
+    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, num_blocks)
+    idx = case["topk_indices"].contiguous()
+    lengths = case["topk_lengths"].contiguous()
+
+    O, lse = run_unified_prefill(
+        q=q,
+        kv_cache=swa_cache,
+        topk_indices=idx,
+        topk_length=lengths,
+        sm_scale=case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+    )
+    torch.cuda.synchronize()
+
+    got = O.float()
+    exp = case["expected_O"].float()
+    got_lse = lse.float()
+    exp_lse = case["expected_lse"].float()
+    assert got.shape == (num_tokens, num_heads, _DSV4_HEAD_DIM)
+    assert torch.isfinite(got).all()
+    assert torch.isfinite(got_lse).all()
+    assert (O != 0).any()
+    cos = _cosine(got, exp)
+    assert cos > 0.999, f"DSV4 prefill heads=8 O cos={cos}"
+    assert (got - exp).abs().max().item() < 2e-2
+    assert (got_lse - exp_lse).abs().max().item() < 5e-2
+
+
+@torch.inference_mode()
+def test_unified_prefill_glm_tp8_topk2048_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLM 5.x TP8 has eight local attention heads and a 2048-token sparse
+    selection.  Exercise that serving shape directly, including the
+    VALID_HPB=8 tail and both contiguous and vLLM packed page-strided caches."""
+    device = require_sm120_sparse_mla()
+    from b12x.attention.mla.kernel import run_unified_prefill
+
+    num_tokens, num_heads, topk = 2, 8, 2048
+    case = glm_ref.make_glm_decode_case(
+        num_heads=num_heads,
+        topk=topk,
+        num_tokens=num_tokens,
+        num_blocks=topk // _GLM_PAGE,
+        page_block_size=_GLM_PAGE,
+        invalidate_half=False,
+        seed=52_820_488,
+        device=device,
+    )
+
+    contiguous_cache = case["kv_cache"].contiguous()
+    num_blocks = topk // _GLM_PAGE
+    page_bytes = _GLM_PAGE * _GLM_KV_BYTES_PER_TOKEN
+    packed_stride = page_bytes + 4096
+    packed_storage = torch.empty(
+        (num_blocks - 1) * packed_stride + page_bytes,
+        dtype=torch.uint8,
+        device=device,
+    )
+    packed_cache = torch.as_strided(
+        packed_storage,
+        size=(num_blocks, _GLM_PAGE, _GLM_KV_BYTES_PER_TOKEN),
+        stride=(packed_stride, _GLM_KV_BYTES_PER_TOKEN, 1),
+    )
+    packed_cache.copy_(
+        contiguous_cache.view(num_blocks, _GLM_PAGE, _GLM_KV_BYTES_PER_TOKEN)
+    )
+    assert not packed_cache.is_contiguous()
+
+    def run(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        result = run_unified_prefill(
+            q=case["q"].contiguous(),
+            kv_cache=kv_cache,
+            topk_indices=case["topk_indices"].contiguous(),
+            sm_scale=case["sm_scale"],
+            page_block_size=_GLM_PAGE,
+        )
+        torch.cuda.synchronize()
+        return result
+
+    # The TP8 packed-row path is an exact reorganization of the accurate
+    # two-pass PV math: HIGH occupies rows 0..7 and LOW rows 8..15 of one m16
+    # tile. Gate its serving default against the former path before comparing
+    # either result to the independent reference.
+    monkeypatch.setenv("B12X_MLA_SM120_PREFILL_PACK_HILO_ROWS", "0")
+    legacy_output, legacy_lse = run(contiguous_cache)
+    monkeypatch.setenv("B12X_MLA_SM120_PREFILL_PACK_HILO_ROWS", "1")
+    optimized_output, optimized_lse = run(contiguous_cache)
+    assert torch.equal(optimized_output, legacy_output)
+    assert torch.equal(optimized_lse, legacy_lse)
+
+    expected = case["expected_O"].float()
+    packed_output, packed_lse = run(packed_cache)
+    for output, lse in (
+        (optimized_output, optimized_lse),
+        (packed_output, packed_lse),
+    ):
+        got = output.float()
+        assert torch.isfinite(got).all()
+        assert torch.isfinite(lse).all()
+        assert (output != 0).any()
+        assert _cosine(got, expected) > 0.995
+        assert (got - expected).abs().max().item() < 3e-2
+        assert (lse.float() - case["expected_lse"].float()).abs().max().item() < 5e-2
+
+
+@torch.inference_mode()
 def test_unified_decode_dual_cache_extra_zero_equals_main_only() -> None:
     """extra_topk=0 (no extra cache) must reduce to the single-cache decode: the
     dual reference's concat is a no-op, so the unified main-only path matches."""
@@ -1046,14 +1241,21 @@ def _make_glm_sparse_scratch(device, *, topk, max_chunks, num_heads, s_kv):
     return plan, storage
 
 
-def _run_unified_glm(device, *, topk, forced_num_splits, seed):
-    """Build a glm_ref GLM decode case (num_heads=128), run the REAL launcher over
-    the GLM 656B cache + sparse scratch, return (got_O, exp_O, eff_splits)."""
+def _run_unified_glm(
+    device,
+    *,
+    topk,
+    forced_num_splits,
+    seed,
+    num_heads=_GLM_NUM_HEADS,
+    use_length_tensor=True,
+):
+    """Build a glm_ref GLM decode case and run the real unified launcher."""
     from b12x.attention.mla.kernel import run_unified_decode
 
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
-        num_heads=_GLM_NUM_HEADS, topk=topk, num_blocks=nblk,
+        num_heads=num_heads, topk=topk, num_blocks=nblk,
         page_block_size=_GLM_PAGE, invalidate_half=True, seed=seed, device=device,
     )
     q = case["q"].contiguous()                    # [1, 128, 576] bf16
@@ -1066,7 +1268,7 @@ def _run_unified_glm(device, *, topk, forced_num_splits, seed):
     n_chunks = (topk + 64 - 1) // 64
     max_chunks = max(8, forced_num_splits)
     plan, storage = _make_glm_sparse_scratch(
-        device, topk=topk, max_chunks=max_chunks, num_heads=_GLM_NUM_HEADS, s_kv=s_kv,
+        device, topk=topk, max_chunks=max_chunks, num_heads=num_heads, s_kv=s_kv,
     )
     cache_seqlens = torch.full((1,), s_kv, dtype=torch.int32, device=device)
     nsa_seqlens = torch.full((1,), topk, dtype=torch.int32, device=device)
@@ -1079,7 +1281,7 @@ def _run_unified_glm(device, *, topk, forced_num_splits, seed):
         q_all=q,
         swa_k_cache=kv_cache,
         swa_indices=idx,
-        swa_topk_lengths=nsa_seqlens,
+        swa_topk_lengths=(nsa_seqlens if use_length_tensor else None),
         workspace=binding.scratch,
         sm_scale=sm_scale,
         swa_page_size=_GLM_PAGE,
@@ -1087,6 +1289,78 @@ def _run_unified_glm(device, *, topk, forced_num_splits, seed):
     )
     torch.cuda.synchronize()
     return out[0].float(), exp_O, min(forced_num_splits, n_chunks)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("forced_num_splits", [1, 4])
+def test_unified_decode_glm_tp8_native_swap_ab_matches_reference(
+    forced_num_splits,
+) -> None:
+    """GLM TP8 uses the native four-warp swapped-QK decode specialization."""
+    device = require_sm120_sparse_mla()
+    import b12x.attention.mla.kernel as launch
+
+    got_O, exp_O, _ = _run_unified_glm(
+        device,
+        topk=256,
+        forced_num_splits=forced_num_splits,
+        seed=52_008 + forced_num_splits,
+        num_heads=8,
+    )
+    plan = launch.LAST_DECODE_PLAN
+    assert plan.get("native_glm_h8") is True
+    assert plan.get("qk_swap_ab") is True
+    assert plan.get("math_warps") == 4
+    assert plan.get("block_threads") == 160
+    assert plan.get("io_warps") == 1
+    assert plan.get("kv_stage_packed") is True
+    assert plan.get("kv_smem_stride") == 656
+    assert plan.get("qk_candidates_per_warp") == 16
+    assert torch.isfinite(got_O).all()
+    assert (got_O != 0).any()
+    cos = _cosine(got_O, exp_O)
+    assert cos > 0.999, f"GLM TP8 splits={forced_num_splits} O cos={cos}"
+    assert (got_O - exp_O).abs().max().item() < 3e-2
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_tp8_native_matches_padded_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native TP8 path preserves the former padded decode numerics."""
+    device = require_sm120_sparse_mla()
+    kwargs = dict(
+        topk=256,
+        forced_num_splits=4,
+        seed=52_016,
+        num_heads=8,
+    )
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_H8_NATIVE", "0")
+    padded, _, _ = _run_unified_glm(device, **kwargs)
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_H8_NATIVE", "1")
+    native, _, _ = _run_unified_glm(device, **kwargs)
+    assert _cosine(native, padded) > 0.999999
+    assert (native - padded).abs().max().item() < 1e-3
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_tp8_native_scalar_length_matches_reference() -> None:
+    """The uniform scalar-length entry uses the same native TP8 math path."""
+    device = require_sm120_sparse_mla()
+    import b12x.attention.mla.kernel as launch
+
+    got_O, exp_O, _ = _run_unified_glm(
+        device,
+        topk=128,
+        forced_num_splits=1,
+        seed=52_128,
+        num_heads=8,
+        use_length_tensor=False,
+    )
+    assert launch.LAST_DECODE_PLAN.get("native_glm_h8") is True
+    assert launch.LAST_DECODE_PLAN.get("per_token_len") is False
+    assert _cosine(got_O, exp_O) > 0.999
+    assert (got_O - exp_O).abs().max().item() < 3e-2
 
 
 @torch.inference_mode()

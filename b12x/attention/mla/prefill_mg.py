@@ -1,13 +1,15 @@
-"""FlashInfer-shaped SM120 DSV4 MG prefill path.
+"""FlashInfer-shaped SM120 DSV4/GLM MG prefill path.
 
-This is a dedicated DSV4/FP8/main-cache prefill kernel matching FlashInfer's
-multi-head-group launch structure for NUM_HEADS in {32, 64, 128}: one CTA handles
-two HPB=16 head groups and reuses a single NoPE KV gather across both groups.
-The DSV4 RoPE payload is intentionally not bulk-staged into smem; QK-RoPE and
-XV-RoPE read it from global/L2.
+One CTA handles up to two HPB=16 head groups and reuses a single NoPE KV gather
+across them. GLM TP8 uses a half-full head group and packs the accurate PV
+HIGH/LOW residual pair into the lower/upper rows of one m16 MMA. The DSV4 RoPE
+payload is intentionally not bulk-staged into smem; QK-RoPE and XV-RoPE read it
+from global/L2.
 """
 
 from __future__ import annotations
+
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -21,18 +23,27 @@ from b12x.attention._cute.ops import LOG2_E
 from b12x.cute.compiler import DimKey, KernelCompileSpec, key_field, tensor_key
 from b12x.cute.compiler import launch as b12x_launch
 from b12x.cute.fp4 import (
-    atomic_max_shared_f32,
+    atomic_max_shared_f32_offset,
+    byte_perm,
+    create_l2_evict_first_policy,
     dequant_kv_e4m3_pair_to_bf16x2,
-    fabs_f32,
     fmax_f32,
+    fmin_f32,
     get_ptr_as_int64,
+    ld_global_b16,
     ld_global_nc_u32,
+    ld_shared_f32_offset,
+    ld_shared_u16_offset,
+    ld_shared_u8_offset,
+    ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
     mma_m16n8k16_f32_bf16,
     mma_m16n8k32_f32_e4m3,
+    quantize_scaled_store_shared_v2_e4m3,
+    rcp_approx_ftz,
     shared_ptr_to_u32,
     st_shared_bf16_from_f32,
-    st_shared_u8,
+    st_shared_f32_offset,
 )
 
 from .decode_math import (
@@ -41,12 +52,11 @@ from .decode_math import (
     _exp2_approx_ftz_f32,
     _ld_u16_zext,
     _ld_u8_zext,
-    _quant_e4m3_byte,
     _ue8m0_byte_to_fp32,
+    _ue8m0_zext_byte_to_fp32,
     ld_shared_f32,
     s0_quantize_q_to_smem,
     s1_qk_nope_block_scaled,
-    s3_mask_and_scale,
     s6_xv_nope,
     st_shared_f32,
     s7_epilogue,
@@ -70,6 +80,53 @@ _DSV4_ROPE_GMEM_OFFSET = 448
 # 4*4 inline-scale bytes). MG reads it from global/L2 (no smem staging).
 _GLM_IO_STRIDE = 656
 _GLM_ROPE_GMEM_OFFSET = 528
+
+
+@cute.jit
+def _ld_global_index_i32(index_base_ptr: Int64, entry: Int32) -> Int32:
+    """Load one selected-token index directly from the tile's global row."""
+    return Int32(
+        ld_global_nc_u32(index_base_ptr + entry.to(Int64) * Int64(4))
+    )
+
+
+@cute.jit
+def s3_mask_and_scale_global(
+    qk,
+    index_base_ptr: Int64,
+    warp_first_cand: Int32,
+    split_cand_start: Int32,
+    split_cand_end: Int32,
+    section_len: Int32,
+    sm_scale_log2: Float32,
+    lane: Int32,
+):
+    """FI-shaped S3: validate candidates from the global selected-index row."""
+    tid = lane & Int32(3)
+    c0 = warp_first_cand + tid * Int32(2)
+    c1 = c0 + Int32(1)
+    abs_c0 = c0 + split_cand_start
+    abs_c1 = c1 + split_cand_start
+
+    idx0 = Int32(-1)
+    if abs_c0 < section_len:
+        idx0 = _ld_global_index_i32(index_base_ptr, c0)
+    idx1 = Int32(-1)
+    if abs_c1 < section_len:
+        idx1 = _ld_global_index_i32(index_base_ptr, c1)
+
+    if abs_c0 >= split_cand_end or idx0 < Int32(0):
+        qk[0] = Float32(-1.0e30)
+        qk[2] = Float32(-1.0e30)
+    if abs_c1 >= split_cand_end or idx1 < Int32(0):
+        qk[1] = Float32(-1.0e30)
+        qk[3] = Float32(-1.0e30)
+
+    qk[0] = qk[0] * sm_scale_log2
+    qk[1] = qk[1] * sm_scale_log2
+    qk[2] = qk[2] * sm_scale_log2
+    qk[3] = qk[3] * sm_scale_log2
+    return qk
 
 
 @cute.jit
@@ -106,11 +163,13 @@ def _cache_base_tensor(cache: torch.Tensor) -> torch.Tensor:
     if cache.ndim < 2:
         return cache
 
-    # Packed vLLM DS4 cache views are [blocks, page_bytes] with a storage_offset
+    # Packed vLLM cache views retain page subdimensions and a storage_offset
     # into a larger per-block allocation. The MG kernels do raw pointer-offset
-    # indexing, so expose the physical byte span for this layer as a 1-D view
-    # and keep the packed block stride in the explicit stride argument.
-    span = (int(cache.shape[0]) - 1) * int(cache.stride(0)) + int(cache.shape[1])
+    # indexing, so expose this layer's full physical span as a 1-D view and keep
+    # the packed block stride in the explicit stride argument.
+    span = 1
+    for size, stride in zip(cache.shape, cache.stride(), strict=True):
+        span += (int(size) - 1) * int(stride)
     return torch.as_strided(cache, size=(span,), stride=(1,))
 
 
@@ -126,7 +185,11 @@ def _cache_block_stride_bytes(
         expected = int(page_size) * _GLM_IO_STRIDE
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
-    if cache.ndim >= 2:
+    # Contiguous inputs are flattened before launch, so their original rank is
+    # not a physical-layout contract and the standard page stride applies.
+    # Packed vLLM page views are non-contiguous and carry the physical
+    # per-block stride in dimension 0.
+    if not cache.is_contiguous() and cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:
             raise ValueError(
@@ -147,38 +210,39 @@ def _smem_byte(base_addr: Int32, byte_off) -> Int32:
 
 
 @cute.jit
-def _dsv4_rope_base_off(idx: Int32, page_block_size: Int32, stride_kv_block: Int64) -> Int64:
-    if idx < Int32(0):
-        idx = Int32(0)
+def _dsv4_record_off(idx: Int32, page_block_size: Int32, stride_kv_block: Int64) -> Int64:
     block_idx = idx // page_block_size
     local_idx = idx - block_idx * page_block_size
     return (
         Int64(block_idx) * stride_kv_block
         + Int64(local_idx) * Int64(_DSV4_IO_STRIDE)
+    )
+
+
+@cute.jit
+def _dsv4_rope_base_off(
+    idx: Int32, page_block_size: Int32, stride_kv_block: Int64
+) -> Int64:
+    """Full DSV4 RoPE-record offset used by the QK prefetch paths."""
+    if idx < Int32(0):
+        idx = Int32(0)
+    return (
+        _dsv4_record_off(idx, page_block_size, stride_kv_block)
         + Int64(_DSV4_ROPE_GMEM_OFFSET)
     )
 
 
 @cute.jit
 def _ld_global_dsv4_rope_b16(
-    kv_cache_u8: cute.Tensor,
+    rope_dim_ptr: Int64,
     idx: Int32,
-    dim: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
 ) -> Uint32:
     out = Uint32(0)
     if idx >= Int32(0):
-        dim_even = dim & ~Int32(1)
-        byte_off = (
-            _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
-            + Int64(dim_even) * Int64(2)
-        )
-        word = ld_global_nc_u32(get_ptr_as_int64(kv_cache_u8, byte_off))
-        if (dim & Int32(1)) != Int32(0):
-            out = (word >> Uint32(16)) & Uint32(0xFFFF)
-        else:
-            out = word & Uint32(0xFFFF)
+        byte_off = _dsv4_record_off(idx, page_block_size, stride_kv_block)
+        out = ld_global_b16(rope_dim_ptr + byte_off)
     return out
 
 
@@ -187,7 +251,7 @@ def s2_qk_rope_global_dsv4(
     qk,
     q_rope_base_addr: Int32,
     kv_cache_u8: cute.Tensor,
-    token_idx_view: cute.Tensor,
+    index_base_ptr: Int64,
     warp_first_cand: Int32,
     lane: Int32,
     page_block_size: Int32,
@@ -200,7 +264,7 @@ def s2_qk_rope_global_dsv4(
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     entry = warp_first_cand + gid
-    idx = Int32(token_idx_view[entry])
+    idx = _ld_global_index_i32(index_base_ptr, entry)
     rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
@@ -229,14 +293,16 @@ def s2_qk_rope_global_mg_dsv4(
     q_rope_g0_addr: Int32,
     q_rope_g1_addr: Int32,
     kv_cache_u8: cute.Tensor,
-    token_idx_view: cute.Tensor,
+    index_base_ptr: Int64,
     warp_first_cand: Int32,
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
     *,
     d_rope: cutlass.Constexpr,
+    q_rope_stride: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """Fused DSV4 QK-RoPE.
 
@@ -254,7 +320,7 @@ def s2_qk_rope_global_mg_dsv4(
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     entry = warp_first_cand + gid
-    idx = Int32(token_idx_view[entry])
+    idx = _ld_global_index_i32(index_base_ptr, entry)
     rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
@@ -269,7 +335,9 @@ def s2_qk_rope_global_mg_dsv4(
                 rope_base + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2),
             )
         )
-        a_byte = a_row * Int32(d_rope * 2) + (ko + a_col) * Int32(2)
+        a_byte = (
+            a_row * Int32(q_rope_stride) + (ko + a_col)
+        ) * Int32(2)
         a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(_smem_byte(q_rope_g0_addr, a_byte))
         qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
             qk0[0], qk0[1], qk0[2], qk0[3], a00, a01, a02, a03, b0, b1
@@ -323,7 +391,7 @@ def s2_qk_rope_regs_mg_glm(
     q_rope_regs0,
     q_rope_regs1,
     kv_cache_u8: cute.Tensor,
-    token_idx_view: cute.Tensor,
+    index_base_ptr: Int64,
     warp_first_cand: Int32,
     lane: Int32,
     page_block_size: Int32,
@@ -331,6 +399,7 @@ def s2_qk_rope_regs_mg_glm(
     *,
     d_rope: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """GLM MG QK-RoPE. Mirrors ``s2_qk_rope_regs_mg_dsv4`` (registerized Q-rope A,
     KV-rope B from global) but with the GLM record geometry and the GLM B-operand
@@ -342,8 +411,9 @@ def s2_qk_rope_regs_mg_glm(
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     entry = warp_first_cand + gid
-    idx = Int32(token_idx_view[entry])
+    idx = _ld_global_index_i32(index_base_ptr, entry)
     rope_base = _glm_rope_base_off(idx, page_block_size, stride_kv_block)
+    hi0 = cutlass.const_expr(valid_hpb > 8)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
@@ -352,12 +422,17 @@ def s2_qk_rope_regs_mg_glm(
         b0 = _ld_global_glm_rope_u32(kv_cache_u8, rope_base, ko + tid * Int32(2))
         b1 = _ld_global_glm_rope_u32(kv_cache_u8, rope_base, ko + tid * Int32(2) + Int32(8))
         base = Int32(ks) * Int32(4)
-        qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+        d0, d1, d2, d3 = mma_m16n8k16_f32_bf16(
             qk0[0], qk0[1], qk0[2], qk0[3],
             q_rope_regs0[base + 0], q_rope_regs0[base + 1],
             q_rope_regs0[base + 2], q_rope_regs0[base + 3],
             b0, b1,
         )
+        qk0[0] = d0
+        qk0[1] = d1
+        if cutlass.const_expr(hi0):
+            qk0[2] = d2
+            qk0[3] = d3
         if cutlass.const_expr(n_hg == 2):
             qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
                 qk1[0], qk1[1], qk1[2], qk1[3],
@@ -392,16 +467,22 @@ def s0_load_q_bf16_to_smem_mg(
     d_rope: cutlass.Constexpr,       # 64
     hpb: cutlass.Constexpr,          # 16
     q_nope_bf16_stride: cutlass.Constexpr,  # D_NOPE + 8
+    q_rope_stride: cutlass.Constexpr,
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """S0 (BF16): cooperative gmem->smem BF16 copy of Q-NoPE + Q-rope for the
     ``n_hg`` head groups. Counterpart to ``s0_quantize_q_to_smem`` -- NO FP8
     quant, no amax/scale (FlashInfer ``load_q_bf16_to_smem``). All HPB heads of
     each group are valid (heads % HPB == 0). The cooperative loops span
     ``n_hg * hpb * d_*`` (one group for n_hg==1); the per-group g==1 store target
-    selection const_expr-elides for n_hg==1 since the loop never reaches g==1."""
+    selection const_expr-elides for n_hg==1 since the loop never reaches g==1.
+
+    ``valid_hpb`` is smaller than ``hpb`` only for the heads==8 small-TP shard.
+    Those inactive rows are zero-filled so the M=16 QK MMA remains well-defined
+    while the epilogue gates stores to the real rows only."""
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
 
     # Q-NoPE -> bf16 smem (all groups). group g head h dim d.
@@ -415,11 +496,16 @@ def s0_load_q_bf16_to_smem_mg(
         if cutlass.const_expr(n_hg == 2):
             if g != Int32(0):
                 dst = q_nope_bf16_g1_addr
-        val = Float32(q_token[head_base + g * Int32(hpb) + h, d])
+        if cutlass.const_expr(valid_hpb == hpb):
+            val = Float32(q_token[head_base + g * Int32(hpb) + h, d])
+        else:
+            val = Float32(0.0)
+            if h < valid_hpb:
+                val = Float32(q_token[head_base + g * Int32(hpb) + h, d])
         st_shared_bf16_from_f32(dst + (h * Int32(q_nope_bf16_stride) + d) * Int32(2), val)
         i += Int32(num_threads)
 
-    # Q-rope -> bf16 smem scratch (all groups). Stride D_ROPE (no pad).
+    # Q-rope -> bf16 smem scratch (all groups), with a bank-layout row pad.
     i = tid
     while i < Int32(n_hg * hpb * d_rope):
         g = i // Int32(hpb * d_rope)
@@ -430,10 +516,60 @@ def s0_load_q_bf16_to_smem_mg(
         if cutlass.const_expr(n_hg == 2):
             if g != Int32(0):
                 dst = q_rope_g1_addr
-        val = Float32(q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d])
-        st_shared_bf16_from_f32(dst + (h * Int32(d_rope) + d) * Int32(2), val)
+        if cutlass.const_expr(valid_hpb == hpb):
+            val = Float32(q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d])
+        else:
+            val = Float32(0.0)
+            if h < valid_hpb:
+                val = Float32(q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d])
+        st_shared_bf16_from_f32(
+            dst + (h * Int32(q_rope_stride) + d) * Int32(2), val
+        )
         i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
+
+
+@cute.jit
+def reload_q_rope_bf16_to_smem_mg(
+    q_token: cute.Tensor,
+    q_rope_g0_addr: Int32,
+    q_rope_g1_addr: Int32,
+    head_base: Int32,
+    tid: Int32,
+    *,
+    d_nope: cutlass.Constexpr,
+    d_rope: cutlass.Constexpr,
+    q_rope_stride: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+    n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
+):
+    """Restore BF16 Q-RoPE into its W_FP8-aliased scratch between tiles."""
+    i = tid
+    while i < Int32(n_hg * hpb * d_rope):
+        g = i // Int32(hpb * d_rope)
+        rem = i - g * Int32(hpb * d_rope)
+        h = rem // Int32(d_rope)
+        d = rem - h * Int32(d_rope)
+        dst = q_rope_g0_addr
+        if cutlass.const_expr(n_hg == 2):
+            if g != Int32(0):
+                dst = q_rope_g1_addr
+        if cutlass.const_expr(valid_hpb == hpb):
+            val = Float32(q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d])
+        else:
+            val = Float32(0.0)
+            if h < valid_hpb:
+                val = Float32(
+                    q_token[head_base + g * Int32(hpb) + h, Int32(d_nope) + d]
+                )
+        st_shared_bf16_from_f32(
+            dst + (h * Int32(q_rope_stride) + d) * Int32(2), val
+        )
+        i += Int32(num_threads)
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
 
 
 @cute.jit
@@ -442,23 +578,51 @@ def preload_q_rope_regs_mg(
     lane: Int32,
     *,
     d_rope: cutlass.Constexpr,        # 64
+    q_rope_stride: cutlass.Constexpr,
 ):
     """Preload one head group's Q-rope (bf16) A operands into registers, ONCE
-    before the main loop (FlashInfer ``preload_q_rope_regs``). Returns a flat
-    python list of (d_rope//16)*4 Uint32 ldmatrix.x4 fragments. The Q-rope smem
-    scratch then aliases the W_FP8 region (only used in S6)."""
+    before the main loop (FlashInfer ``preload_q_rope_regs``).
+
+    Keep these as sixteen independent SSA values.  Both a Python list and a
+    CuTe register tensor that cross the dynamic tile loop become addressable
+    local arrays in the current DSL lowering, producing sixteen STL.64 stores
+    in the prologue and sixteen LDL.64 reloads per tile.  DSV4/GLM both have a
+    fixed 64-d RoPE, so spelling out the four ldmatrix operations is exact and
+    lets ptxas allocate the fragments as ordinary registers.
+    """
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
-    regs = []
-    for ks in cutlass.range_constexpr(d_rope // 16):
-        ko = Int32(ks) * Int32(16)
-        a_byte = a_row * Int32(d_rope * 2) + (ko + a_col) * Int32(2)
-        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_byte(q_rope_base_addr, a_byte))
-        regs.append(a0)
-        regs.append(a1)
-        regs.append(a2)
-        regs.append(a3)
-    return regs
+    a_byte = a_row * Int32(q_rope_stride * 2) + a_col * Int32(2)
+    a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
+        _smem_byte(q_rope_base_addr, a_byte)
+    )
+    a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
+        _smem_byte(q_rope_base_addr, a_byte + Int32(32))
+    )
+    a20, a21, a22, a23 = ldmatrix_m8n8x4_b16(
+        _smem_byte(q_rope_base_addr, a_byte + Int32(64))
+    )
+    a30, a31, a32, a33 = ldmatrix_m8n8x4_b16(
+        _smem_byte(q_rope_base_addr, a_byte + Int32(96))
+    )
+    return (
+        a00,
+        a01,
+        a02,
+        a03,
+        a10,
+        a11,
+        a12,
+        a13,
+        a20,
+        a21,
+        a22,
+        a23,
+        a30,
+        a31,
+        a32,
+        a33,
+    )
 
 
 @cute.jit
@@ -496,18 +660,28 @@ def s1_qk_nope_bf16_mg2(
     a_col = (lane >> Int32(4)) * Int32(8)
     # The K row this lane group reads for the dequant B operand.
     kv_gid_row = warp_first_cand + gid
+    kv_lane_base = (
+        kv_fp8_base_addr
+        + kv_gid_row * Int32(kv_smem_stride)
+        + tid * Int32(2)
+    )
+    kv_sc_row_base = (
+        kv_sc_base_addr + kv_gid_row * Int32(scale_bytes_per_token)
+    )
 
     for blk in cutlass.range_constexpr(num_scales):
         # DSV4 UE8M0_BYTE: per-(token,blk) fp32 scale from the K footer scale buf.
-        sc_byte_off = kv_gid_row * Int32(scale_bytes_per_token) + Int32(blk)
-        scale_f = _ue8m0_byte_to_fp32(_ld_u8_zext(kv_sc_base_addr, sc_byte_off))
+        scale_f = _ue8m0_zext_byte_to_fp32(
+            ld_shared_u8_offset(kv_sc_row_base, blk)
+        )
         for ks in cutlass.range_constexpr(quant_tile // 16):
             ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
             # K dequant B operand: two e4m3 byte-pairs (u16) -> bf16x2 b0/b1.
             # _ld_u16_zext handles the 2-byte (non-4-aligned) offsets safely.
-            kv_row_base = kv_gid_row * Int32(kv_smem_stride) + ko
-            p0 = _ld_u16_zext(kv_fp8_base_addr, kv_row_base + tid * Int32(2))
-            p1 = _ld_u16_zext(kv_fp8_base_addr, kv_row_base + tid * Int32(2) + Int32(8))
+            p0 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16)
+            p1 = ld_shared_u16_offset(
+                kv_lane_base, blk * quant_tile + ks * 16 + 8
+            )
             b0, b1 = dequant_kv_e4m3_pair_to_bf16x2(p0, p1, scale_f)
             # Group 0 A operand + MMA.
             a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
@@ -529,13 +703,173 @@ def s1_qk_nope_bf16_mg2(
 
 
 @cute.jit
+def prefetch_kv_rope_regs_dsv4(
+    rope_base_ptr: Int64,
+    lane: Int32,
+    *,
+    d_rope: cutlass.Constexpr,
+):
+    """Prefetch one candidate's KV-RoPE B operands before the NoPE MMAs."""
+    tid = lane & Int32(3)
+    regs = cute.make_rmem_tensor((d_rope // 16 * 2,), Uint32)
+    for ks in cutlass.range_constexpr(d_rope // 16):
+        ko = Int32(ks) * Int32(16)
+        base = ks * 2
+        regs[base + 0] = ld_global_nc_u32(
+            rope_base_ptr + Int64(ko + tid * Int32(2)) * Int64(2)
+        )
+        regs[base + 1] = ld_global_nc_u32(
+            rope_base_ptr
+            + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2)
+        )
+    return regs
+
+
+@cute.jit
+def s2_qk_rope_prefetched_mg_dsv4_scalar(
+    qk0,
+    qk1,
+    q000: Uint32,
+    q001: Uint32,
+    q002: Uint32,
+    q003: Uint32,
+    q010: Uint32,
+    q011: Uint32,
+    q012: Uint32,
+    q013: Uint32,
+    q020: Uint32,
+    q021: Uint32,
+    q022: Uint32,
+    q023: Uint32,
+    q030: Uint32,
+    q031: Uint32,
+    q032: Uint32,
+    q033: Uint32,
+    q100: Uint32,
+    q101: Uint32,
+    q102: Uint32,
+    q103: Uint32,
+    q110: Uint32,
+    q111: Uint32,
+    q112: Uint32,
+    q113: Uint32,
+    q120: Uint32,
+    q121: Uint32,
+    q122: Uint32,
+    q123: Uint32,
+    q130: Uint32,
+    q131: Uint32,
+    q132: Uint32,
+    q133: Uint32,
+    kv_rope_regs,
+    *,
+    n_hg: cutlass.Constexpr = 2,
+):
+    """DSV4 BF16 QK-RoPE with persistent Q fragments as scalar SSA values.
+
+    The CuTe lowering makes a Q-fragment list/tensor that crosses the dynamic
+    candidate loop addressable, which generates a local-memory store in the
+    prologue and a local-memory reload on every tile. Keep all 32 fragments as
+    explicit operands through the four fixed DSV4 RoPE MMAs instead. The MMA
+    helper is inline PTX, so this is also an explicit register-allocation
+    boundary for LLVM/ptxas without adding any capture-time state.
+    """
+    qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+        qk0[0], qk0[1], qk0[2], qk0[3], q000, q001, q002, q003,
+        kv_rope_regs[0], kv_rope_regs[1],
+    )
+    qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+        qk0[0], qk0[1], qk0[2], qk0[3], q010, q011, q012, q013,
+        kv_rope_regs[2], kv_rope_regs[3],
+    )
+    qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+        qk0[0], qk0[1], qk0[2], qk0[3], q020, q021, q022, q023,
+        kv_rope_regs[4], kv_rope_regs[5],
+    )
+    qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+        qk0[0], qk0[1], qk0[2], qk0[3], q030, q031, q032, q033,
+        kv_rope_regs[6], kv_rope_regs[7],
+    )
+    if cutlass.const_expr(n_hg == 2):
+        qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+            qk1[0], qk1[1], qk1[2], qk1[3], q100, q101, q102, q103,
+            kv_rope_regs[0], kv_rope_regs[1],
+        )
+        qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+            qk1[0], qk1[1], qk1[2], qk1[3], q110, q111, q112, q113,
+            kv_rope_regs[2], kv_rope_regs[3],
+        )
+        qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+            qk1[0], qk1[1], qk1[2], qk1[3], q120, q121, q122, q123,
+            kv_rope_regs[4], kv_rope_regs[5],
+        )
+        qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+            qk1[0], qk1[1], qk1[2], qk1[3], q130, q131, q132, q133,
+            kv_rope_regs[6], kv_rope_regs[7],
+        )
+    return qk0, qk1
+
+
+@cute.jit
+def s2_qk_rope_shared_prefetched_mg_dsv4(
+    qk0,
+    qk1,
+    q_rope_g0_addr: Int32,
+    q_rope_g1_addr: Int32,
+    kv_rope_regs,
+    lane: Int32,
+    *,
+    d_rope: cutlass.Constexpr,
+    q_rope_stride: cutlass.Constexpr,
+    n_hg: cutlass.Constexpr = 2,
+):
+    """BF16 QK-RoPE with persistent shared Q and prefetched KV operands."""
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    for ks in cutlass.range_constexpr(d_rope // 16):
+        ko = Int32(ks) * Int32(16)
+        a_byte = (
+            a_row * Int32(q_rope_stride) + (ko + a_col)
+        ) * Int32(2)
+        bbase = ks * 2
+        a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(q_rope_g0_addr + a_byte)
+        qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+            qk0[0],
+            qk0[1],
+            qk0[2],
+            qk0[3],
+            a00,
+            a01,
+            a02,
+            a03,
+            kv_rope_regs[bbase + 0],
+            kv_rope_regs[bbase + 1],
+        )
+        if cutlass.const_expr(n_hg == 2):
+            a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(q_rope_g1_addr + a_byte)
+            qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+                qk1[0],
+                qk1[1],
+                qk1[2],
+                qk1[3],
+                a10,
+                a11,
+                a12,
+                a13,
+                kv_rope_regs[bbase + 0],
+                kv_rope_regs[bbase + 1],
+            )
+    return qk0, qk1
+
+
+@cute.jit
 def s2_qk_rope_regs_mg_dsv4(
     qk0,
     qk1,
     q_rope_regs0,
     q_rope_regs1,
     kv_cache_u8: cute.Tensor,
-    token_idx_view: cute.Tensor,
+    index_base_ptr: Int64,
     warp_first_cand: Int32,
     lane: Int32,
     page_block_size: Int32,
@@ -544,26 +878,26 @@ def s2_qk_rope_regs_mg_dsv4(
     d_rope: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
 ):
-    """Fused DSV4 QK-RoPE for the BF16 path. Identical to
-    ``s2_qk_rope_global_mg_dsv4`` except the Q-rope A operands come from the
-    preloaded registers (the Q-rope smem aliases W_FP8). KV-RoPE B operand is
-    gathered ONCE per CTA tile and reused across both groups. When ``n_hg==1``
-    the group-1 MMA const_expr-elides."""
+    """Fused BF16 QK-RoPE with interleaved B loads for non-dual SWA."""
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     entry = warp_first_cand + gid
-    idx = Int32(token_idx_view[entry])
+    idx = _ld_global_index_i32(index_base_ptr, entry)
     rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
         b0 = ld_global_nc_u32(
-            get_ptr_as_int64(kv_cache_u8, rope_base + Int64(ko + tid * Int32(2)) * Int64(2))
+            get_ptr_as_int64(
+                kv_cache_u8,
+                rope_base + Int64(ko + tid * Int32(2)) * Int64(2),
+            )
         )
         b1 = ld_global_nc_u32(
             get_ptr_as_int64(
                 kv_cache_u8,
-                rope_base + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2),
+                rope_base
+                + Int64(ko + Int32(8) + tid * Int32(2)) * Int64(2),
             )
         )
         base = Int32(ks) * Int32(4)
@@ -600,7 +934,7 @@ def s6b_xv_rope_global_dsv4(
     acc_rope,
     sm_p_full_addr: Int32,
     kv_cache_u8: cute.Tensor,
-    token_idx_view: cute.Tensor,
+    index_base_ptr: Int64,
     warp_id: Int32,
     lane: Int32,
     page_block_size: Int32,
@@ -614,6 +948,10 @@ def s6b_xv_rope_global_dsv4(
     tid = lane & Int32(3)
     rope_dim_base = warp_id * Int32(d_rope // n_warps)
     dim_n = rope_dim_base + gid
+    rope_dim_ptr = get_ptr_as_int64(
+        kv_cache_u8,
+        Int64(_DSV4_ROPE_GMEM_OFFSET) + Int64(dim_n) * Int64(2),
+    )
 
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
@@ -624,21 +962,21 @@ def s6b_xv_rope_global_dsv4(
         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
 
         ent0 = k_base + tid * Int32(2)
-        idx0 = Int32(token_idx_view[ent0])
-        idx1 = Int32(token_idx_view[ent0 + Int32(1)])
-        idx8 = Int32(token_idx_view[ent0 + Int32(8)])
-        idx9 = Int32(token_idx_view[ent0 + Int32(9)])
+        idx0 = _ld_global_index_i32(index_base_ptr, ent0)
+        idx1 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(1))
+        idx8 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(8))
+        idx9 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(9))
         v0 = _ld_global_dsv4_rope_b16(
-            kv_cache_u8, idx0, dim_n, page_block_size, stride_kv_block
+            rope_dim_ptr, idx0, page_block_size, stride_kv_block
         )
         v1 = _ld_global_dsv4_rope_b16(
-            kv_cache_u8, idx1, dim_n, page_block_size, stride_kv_block
+            rope_dim_ptr, idx1, page_block_size, stride_kv_block
         )
         v8 = _ld_global_dsv4_rope_b16(
-            kv_cache_u8, idx8, dim_n, page_block_size, stride_kv_block
+            rope_dim_ptr, idx8, page_block_size, stride_kv_block
         )
         v9 = _ld_global_dsv4_rope_b16(
-            kv_cache_u8, idx9, dim_n, page_block_size, stride_kv_block
+            rope_dim_ptr, idx9, page_block_size, stride_kv_block
         )
         b0 = v0 | (v1 << Uint32(16))
         b1 = v8 | (v9 << Uint32(16))
@@ -652,51 +990,112 @@ def s6b_xv_rope_global_dsv4(
 def s6b_xv_rope_global_mg_dsv4(
     acc_rope0,
     acc_rope1,
-    sm_p_g0_addr: Int32,
-    sm_p_g1_addr: Int32,
+    w_pre0,
+    w_pre1,
+    weight_smem_addr: Int32,
     kv_cache_u8: cute.Tensor,
-    token_idx_view: cute.Tensor,
+    index_base_ptr: Int64,
     warp_id: Int32,
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
     *,
     bi: cutlass.Constexpr,
+    sm_p_stride: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
     d_rope: cutlass.Constexpr,
     n_warps: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
 ):
+    two = cutlass.const_expr(n_hg == 2)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     rope_dim_base = warp_id * Int32(d_rope // n_warps)
     dim_n = rope_dim_base + gid
+    rope_dim_ptr = get_ptr_as_int64(
+        kv_cache_u8,
+        Int64(_DSV4_ROPE_GMEM_OFFSET) + Int64(dim_n) * Int64(2),
+    )
 
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
 
+    # W_FP8 is dead after XV-NoPE.  Synchronize its final readers, then stage
+    # this warp's current weights into the same region for XV-RoPE.  This is the
+    # native MG lifetime: no separate persistent sm_p_full allocation.
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
+    warp_first_cand = warp_id * Int32(8)
+    cand_e0 = warp_first_cand + tid * Int32(2)
+    cand_e1 = cand_e0 + Int32(1)
+    group_stride = Int32(sm_p_stride * hpb * 2)
+    sm_p_g0_addr = weight_smem_addr
+    sm_p_g1_addr = weight_smem_addr + group_stride
+    st_shared_bf16_from_f32(
+        sm_p_g0_addr + (gid * Int32(sm_p_stride) + cand_e0) * Int32(2), w_pre0[0]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_g0_addr + (gid * Int32(sm_p_stride) + cand_e1) * Int32(2), w_pre0[1]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_g0_addr
+        + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e0) * Int32(2),
+        w_pre0[2],
+    )
+    st_shared_bf16_from_f32(
+        sm_p_g0_addr
+        + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e1) * Int32(2),
+        w_pre0[3],
+    )
+    if cutlass.const_expr(two):
+        st_shared_bf16_from_f32(
+            sm_p_g1_addr
+            + (gid * Int32(sm_p_stride) + cand_e0) * Int32(2),
+            w_pre1[0],
+        )
+        st_shared_bf16_from_f32(
+            sm_p_g1_addr
+            + (gid * Int32(sm_p_stride) + cand_e1) * Int32(2),
+            w_pre1[1],
+        )
+        st_shared_bf16_from_f32(
+            sm_p_g1_addr
+            + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e0) * Int32(2),
+            w_pre1[2],
+        )
+        st_shared_bf16_from_f32(
+            sm_p_g1_addr
+            + ((gid + Int32(8)) * Int32(sm_p_stride) + cand_e1) * Int32(2),
+            w_pre1[3],
+        )
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
+
     for ks in cutlass.range_constexpr(bi // 16):
         k_base = Int32(ks) * Int32(16)
         ent0 = k_base + tid * Int32(2)
-        idx0 = Int32(token_idx_view[ent0])
-        idx1 = Int32(token_idx_view[ent0 + Int32(1)])
-        idx8 = Int32(token_idx_view[ent0 + Int32(8)])
-        idx9 = Int32(token_idx_view[ent0 + Int32(9)])
+        idx0 = _ld_global_index_i32(index_base_ptr, ent0)
+        idx1 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(1))
+        idx8 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(8))
+        idx9 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(9))
         v0 = _ld_global_dsv4_rope_b16(
-            kv_cache_u8, idx0, dim_n, page_block_size, stride_kv_block
+            rope_dim_ptr, idx0, page_block_size, stride_kv_block
         )
         v1 = _ld_global_dsv4_rope_b16(
-            kv_cache_u8, idx1, dim_n, page_block_size, stride_kv_block
+            rope_dim_ptr, idx1, page_block_size, stride_kv_block
         )
         v8 = _ld_global_dsv4_rope_b16(
-            kv_cache_u8, idx8, dim_n, page_block_size, stride_kv_block
+            rope_dim_ptr, idx8, page_block_size, stride_kv_block
         )
         v9 = _ld_global_dsv4_rope_b16(
-            kv_cache_u8, idx9, dim_n, page_block_size, stride_kv_block
+            rope_dim_ptr, idx9, page_block_size, stride_kv_block
         )
         b0 = v0 | (v1 << Uint32(16))
         b1 = v8 | (v9 << Uint32(16))
 
-        a_byte = (a_row * Int32(bi) + (k_base + a_col)) * Int32(2)
+        a_byte = (
+            a_row * Int32(sm_p_stride) + (k_base + a_col)
+        ) * Int32(2)
         a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(sm_p_g0_addr + a_byte)
         acc_rope0[0], acc_rope0[1], acc_rope0[2], acc_rope0[3] = (
             mma_m16n8k16_f32_bf16(
@@ -712,7 +1111,7 @@ def s6b_xv_rope_global_mg_dsv4(
                 b1,
             )
         )
-        if cutlass.const_expr(n_hg == 2):
+        if cutlass.const_expr(two):
             a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(sm_p_g1_addr + a_byte)
             acc_rope1[0], acc_rope1[1], acc_rope1[2], acc_rope1[3] = (
                 mma_m16n8k16_f32_bf16(
@@ -741,14 +1140,15 @@ def s4_online_softmax_mg2(
     acc1,
     rope0,
     rope1,
-    gm0,
-    gm1,
     gs0,
     gs1,
-    reduce0_max_addr: Int32,
-    reduce0_sum_addr: Int32,
-    reduce1_max_addr: Int32,
-    reduce1_sum_addr: Int32,
+    acc0_frag: cute.Tensor,
+    acc1_frag: cute.Tensor,
+    rope0_frag: cute.Tensor,
+    rope1_frag: cute.Tensor,
+    gsum0_frag: cute.Tensor,
+    gsum1_frag: cute.Tensor,
+    reduce_addr: Int32,
     warp_id: Int32,
     lane: Int32,
     tid_flat: Int32,
@@ -759,7 +1159,10 @@ def s4_online_softmax_mg2(
     num_threads: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
     n_acc_tiles: cutlass.Constexpr,
+    reduce_group_bytes: cutlass.Constexpr,
+    reduce_sum_off: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """S4 online softmax with FlashInfer-style deferred row sums. Every group-1
     statement is gated inline behind ``const_expr(n_hg == 2)`` so the n_hg==2
@@ -767,101 +1170,176 @@ def s4_online_softmax_mg2(
     n_hg==1 cleanly elides all qk1/acc1/rope1/gs1/reduce1 work (single HPB head
     group; the cross-warp reduce spans tid_flat < hpb, group 0 only)."""
     two = cutlass.const_expr(n_hg == 2)
+    hi0 = cutlass.const_expr(valid_hpb > 8)
+    reduce_heads = cutlass.const_expr(n_hg * hpb if n_hg == 2 else valid_hpb)
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
 
     lm00 = fmax_f32(qk0[0], qk0[1])
-    lm01 = fmax_f32(qk0[2], qk0[3])
+    if cutlass.const_expr(hi0):
+        lm01 = fmax_f32(qk0[2], qk0[3])
     if cutlass.const_expr(two):
         lm10 = fmax_f32(qk1[0], qk1[1])
         lm11 = fmax_f32(qk1[2], qk1[3])
     lm00 = fmax_f32(lm00, cute.arch.shuffle_sync_bfly(lm00, offset=2))
-    lm01 = fmax_f32(lm01, cute.arch.shuffle_sync_bfly(lm01, offset=2))
+    if cutlass.const_expr(hi0):
+        lm01 = fmax_f32(lm01, cute.arch.shuffle_sync_bfly(lm01, offset=2))
     if cutlass.const_expr(two):
         lm10 = fmax_f32(lm10, cute.arch.shuffle_sync_bfly(lm10, offset=2))
         lm11 = fmax_f32(lm11, cute.arch.shuffle_sync_bfly(lm11, offset=2))
     lm00 = fmax_f32(lm00, cute.arch.shuffle_sync_bfly(lm00, offset=1))
-    lm01 = fmax_f32(lm01, cute.arch.shuffle_sync_bfly(lm01, offset=1))
+    if cutlass.const_expr(hi0):
+        lm01 = fmax_f32(lm01, cute.arch.shuffle_sync_bfly(lm01, offset=1))
     if cutlass.const_expr(two):
         lm10 = fmax_f32(lm10, cute.arch.shuffle_sync_bfly(lm10, offset=1))
         lm11 = fmax_f32(lm11, cute.arch.shuffle_sync_bfly(lm11, offset=1))
 
+    reduce_warp_head_addr = (
+        reduce_addr + (warp_id * Int32(hpb) + gid) * Int32(4)
+    )
     if tid == Int32(0):
-        st_shared_f32(reduce0_max_addr + (warp_id * Int32(hpb) + gid) * Int32(4), lm00)
-        st_shared_f32(
-            reduce0_max_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
-            lm01,
-        )
+        st_shared_f32_offset(reduce_warp_head_addr, 0, lm00)
+        if cutlass.const_expr(hi0):
+            st_shared_f32_offset(reduce_warp_head_addr, 8 * 4, lm01)
         if cutlass.const_expr(two):
-            st_shared_f32(reduce1_max_addr + (warp_id * Int32(hpb) + gid) * Int32(4), lm10)
-            st_shared_f32(
-                reduce1_max_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
-                lm11,
+            st_shared_f32_offset(
+                reduce_warp_head_addr, reduce_group_bytes, lm10
+            )
+            st_shared_f32_offset(
+                reduce_warp_head_addr, reduce_group_bytes + 8 * 4, lm11
             )
     cute.arch.barrier(**bar_kw)
 
-    if tid_flat < Int32(n_hg * hpb):
-        group = tid_flat // Int32(hpb)
-        h = tid_flat - group * Int32(hpb)
-        rmax = reduce0_max_addr
+    if tid_flat < Int32(reduce_heads):
         if cutlass.const_expr(two):
-            if group != Int32(0):
-                rmax = reduce1_max_addr
+            group = tid_flat // Int32(hpb)
+            h = tid_flat - group * Int32(hpb)
+        else:
+            group = Int32(0)
+            h = tid_flat
+        reduce_head_addr = (
+            reduce_addr
+            + group * Int32(reduce_group_bytes)
+            + h * Int32(4)
+        )
+        old_m = ld_shared_f32_offset(reduce_head_addr, reduce_sum_off)
         bmax = Float32(-1e30)
         for w in cutlass.range_constexpr(n_warps):
-            wm = ld_shared_f32(rmax + (Int32(w) * Int32(hpb) + h) * Int32(4))
+            wm = ld_shared_f32_offset(
+                reduce_head_addr, w * hpb * 4
+            )
             bmax = fmax_f32(bmax, wm)
-        st_shared_f32(rmax + h * Int32(4), bmax)
+        new_m = fmax_f32(old_m, bmax)
+        alpha = _exp2_approx_ftz_f32(old_m - new_m)
+        # The max-reduction tile is dead after this thread has consumed its
+        # column. Reuse warp slots 0 and 1 for the alpha/new-max broadcast,
+        # exactly as FI does. The sum region's first HPB values hold persistent
+        # max until the post-loop sum reduction overwrites that scratch.
+        st_shared_f32_offset(reduce_head_addr, reduce_sum_off, new_m)
+        st_shared_f32_offset(reduce_head_addr, 0, alpha)
+        st_shared_f32_offset(reduce_head_addr, hpb * 4, new_m)
     cute.arch.barrier(**bar_kw)
 
-    blm00 = ld_shared_f32(reduce0_max_addr + gid * Int32(4))
-    blm01 = ld_shared_f32(reduce0_max_addr + (gid + Int32(8)) * Int32(4))
+    reduce_lane_head_addr = reduce_addr + gid * Int32(4)
+    alpha00 = ld_shared_f32_offset(reduce_lane_head_addr, 0)
+    ngm00 = ld_shared_f32_offset(reduce_lane_head_addr, hpb * 4)
+    if cutlass.const_expr(hi0):
+        alpha01 = ld_shared_f32_offset(reduce_lane_head_addr, 8 * 4)
+        ngm01 = ld_shared_f32_offset(
+            reduce_lane_head_addr, hpb * 4 + 8 * 4
+        )
     if cutlass.const_expr(two):
-        blm10 = ld_shared_f32(reduce1_max_addr + gid * Int32(4))
-        blm11 = ld_shared_f32(reduce1_max_addr + (gid + Int32(8)) * Int32(4))
+        alpha10 = ld_shared_f32_offset(
+            reduce_lane_head_addr, reduce_group_bytes
+        )
+        alpha11 = ld_shared_f32_offset(
+            reduce_lane_head_addr, reduce_group_bytes + 8 * 4
+        )
+        ngm10 = ld_shared_f32_offset(
+            reduce_lane_head_addr, reduce_group_bytes + hpb * 4
+        )
+        ngm11 = ld_shared_f32_offset(
+            reduce_lane_head_addr,
+            reduce_group_bytes + hpb * 4 + 8 * 4,
+        )
 
-    ngm00 = fmax_f32(gm0[0], blm00)
-    ngm01 = fmax_f32(gm0[1], blm01)
+    # Match FI's online-softmax fast path.  A row whose running maximum did
+    # not change has alpha==1 exactly, so rescaling its persistent accumulators
+    # is mathematically and numerically a no-op.  Write the persistent register
+    # tensors inside the device branch, then rebuild the Python-list views
+    # below.  Mutating a nested Python list in a dynamic CuTe branch does not
+    # form loop-carried SSA results and the lowering silently dead-codes those
+    # updates; register-tensor writes are represented explicitly through the
+    # control-flow merge.
+    if cutlass.const_expr(hi0):
+        if fmin_f32(alpha00, alpha01) < Float32(1.0):
+            for vc in cutlass.range_constexpr(n_acc_tiles):
+                acc0_frag[vc * 4 + 0] = acc0_frag[vc * 4 + 0] * alpha00
+                acc0_frag[vc * 4 + 1] = acc0_frag[vc * 4 + 1] * alpha00
+                acc0_frag[vc * 4 + 2] = acc0_frag[vc * 4 + 2] * alpha01
+                acc0_frag[vc * 4 + 3] = acc0_frag[vc * 4 + 3] * alpha01
+            rope0_frag[0] = rope0_frag[0] * alpha00
+            rope0_frag[1] = rope0_frag[1] * alpha00
+            rope0_frag[2] = rope0_frag[2] * alpha01
+            rope0_frag[3] = rope0_frag[3] * alpha01
+            gsum0_frag[0] = gsum0_frag[0] * alpha00
+            gsum0_frag[1] = gsum0_frag[1] * alpha01
+    else:
+        if alpha00 < Float32(1.0):
+            for vc in cutlass.range_constexpr(n_acc_tiles):
+                acc0_frag[vc * 4 + 0] = acc0_frag[vc * 4 + 0] * alpha00
+                acc0_frag[vc * 4 + 1] = acc0_frag[vc * 4 + 1] * alpha00
+            rope0_frag[0] = rope0_frag[0] * alpha00
+            rope0_frag[1] = rope0_frag[1] * alpha00
+            gsum0_frag[0] = gsum0_frag[0] * alpha00
+
     if cutlass.const_expr(two):
-        ngm10 = fmax_f32(gm1[0], blm10)
-        ngm11 = fmax_f32(gm1[1], blm11)
-    alpha00 = _exp2_approx_ftz_f32(gm0[0] - ngm00)
-    alpha01 = _exp2_approx_ftz_f32(gm0[1] - ngm01)
-    if cutlass.const_expr(two):
-        alpha10 = _exp2_approx_ftz_f32(gm1[0] - ngm10)
-        alpha11 = _exp2_approx_ftz_f32(gm1[1] - ngm11)
+        if fmin_f32(alpha10, alpha11) < Float32(1.0):
+            for vc in cutlass.range_constexpr(n_acc_tiles):
+                acc1_frag[vc * 4 + 0] = acc1_frag[vc * 4 + 0] * alpha10
+                acc1_frag[vc * 4 + 1] = acc1_frag[vc * 4 + 1] * alpha10
+                acc1_frag[vc * 4 + 2] = acc1_frag[vc * 4 + 2] * alpha11
+                acc1_frag[vc * 4 + 3] = acc1_frag[vc * 4 + 3] * alpha11
+            rope1_frag[0] = rope1_frag[0] * alpha10
+            rope1_frag[1] = rope1_frag[1] * alpha10
+            rope1_frag[2] = rope1_frag[2] * alpha11
+            rope1_frag[3] = rope1_frag[3] * alpha11
+            gsum1_frag[0] = gsum1_frag[0] * alpha10
+            gsum1_frag[1] = gsum1_frag[1] * alpha11
 
     for vc in cutlass.range_constexpr(n_acc_tiles):
-        acc0[vc][0] = acc0[vc][0] * alpha00
-        acc0[vc][1] = acc0[vc][1] * alpha00
-        acc0[vc][2] = acc0[vc][2] * alpha01
-        acc0[vc][3] = acc0[vc][3] * alpha01
-        if cutlass.const_expr(two):
-            acc1[vc][0] = acc1[vc][0] * alpha10
-            acc1[vc][1] = acc1[vc][1] * alpha10
-            acc1[vc][2] = acc1[vc][2] * alpha11
-            acc1[vc][3] = acc1[vc][3] * alpha11
-    rope0[0] = rope0[0] * alpha00
-    rope0[1] = rope0[1] * alpha00
-    rope0[2] = rope0[2] * alpha01
-    rope0[3] = rope0[3] * alpha01
+        acc0[vc][0] = acc0_frag[vc * 4 + 0]
+        acc0[vc][1] = acc0_frag[vc * 4 + 1]
+        acc0[vc][2] = acc0_frag[vc * 4 + 2]
+        acc0[vc][3] = acc0_frag[vc * 4 + 3]
+    rope0[0] = rope0_frag[0]
+    rope0[1] = rope0_frag[1]
+    rope0[2] = rope0_frag[2]
+    rope0[3] = rope0_frag[3]
+    gs0[0] = gsum0_frag[0]
+    gs0[1] = gsum0_frag[1]
     if cutlass.const_expr(two):
-        rope1[0] = rope1[0] * alpha10
-        rope1[1] = rope1[1] * alpha10
-        rope1[2] = rope1[2] * alpha11
-        rope1[3] = rope1[3] * alpha11
-
-    gs0[0] = gs0[0] * alpha00
-    gs0[1] = gs0[1] * alpha01
-    if cutlass.const_expr(two):
-        gs1[0] = gs1[0] * alpha10
-        gs1[1] = gs1[1] * alpha11
+        for vc in cutlass.range_constexpr(n_acc_tiles):
+            acc1[vc][0] = acc1_frag[vc * 4 + 0]
+            acc1[vc][1] = acc1_frag[vc * 4 + 1]
+            acc1[vc][2] = acc1_frag[vc * 4 + 2]
+            acc1[vc][3] = acc1_frag[vc * 4 + 3]
+        rope1[0] = rope1_frag[0]
+        rope1[1] = rope1_frag[1]
+        rope1[2] = rope1_frag[2]
+        rope1[3] = rope1_frag[3]
+        gs1[0] = gsum1_frag[0]
+        gs1[1] = gsum1_frag[1]
 
     p0[0] = _exp2_approx_ftz_f32(qk0[0] - ngm00)
     p0[1] = _exp2_approx_ftz_f32(qk0[1] - ngm00)
-    p0[2] = _exp2_approx_ftz_f32(qk0[2] - ngm01)
-    p0[3] = _exp2_approx_ftz_f32(qk0[3] - ngm01)
+    if cutlass.const_expr(hi0):
+        p0[2] = _exp2_approx_ftz_f32(qk0[2] - ngm01)
+        p0[3] = _exp2_approx_ftz_f32(qk0[3] - ngm01)
+    else:
+        p0[2] = Float32(0.0)
+        p0[3] = Float32(0.0)
     if cutlass.const_expr(two):
         p1[0] = _exp2_approx_ftz_f32(qk1[0] - ngm10)
         p1[1] = _exp2_approx_ftz_f32(qk1[1] - ngm10)
@@ -869,31 +1347,30 @@ def s4_online_softmax_mg2(
         p1[3] = _exp2_approx_ftz_f32(qk1[3] - ngm11)
 
     ls00 = p0[0] + p0[1]
-    ls01 = p0[2] + p0[3]
+    if cutlass.const_expr(hi0):
+        ls01 = p0[2] + p0[3]
     if cutlass.const_expr(two):
         ls10 = p1[0] + p1[1]
         ls11 = p1[2] + p1[3]
     ls00 = ls00 + cute.arch.shuffle_sync_bfly(ls00, offset=2)
-    ls01 = ls01 + cute.arch.shuffle_sync_bfly(ls01, offset=2)
+    if cutlass.const_expr(hi0):
+        ls01 = ls01 + cute.arch.shuffle_sync_bfly(ls01, offset=2)
     if cutlass.const_expr(two):
         ls10 = ls10 + cute.arch.shuffle_sync_bfly(ls10, offset=2)
         ls11 = ls11 + cute.arch.shuffle_sync_bfly(ls11, offset=2)
     ls00 = ls00 + cute.arch.shuffle_sync_bfly(ls00, offset=1)
-    ls01 = ls01 + cute.arch.shuffle_sync_bfly(ls01, offset=1)
+    if cutlass.const_expr(hi0):
+        ls01 = ls01 + cute.arch.shuffle_sync_bfly(ls01, offset=1)
     if cutlass.const_expr(two):
         ls10 = ls10 + cute.arch.shuffle_sync_bfly(ls10, offset=1)
         ls11 = ls11 + cute.arch.shuffle_sync_bfly(ls11, offset=1)
 
     gs0[0] = gs0[0] + ls00
-    gs0[1] = gs0[1] + ls01
+    if cutlass.const_expr(hi0):
+        gs0[1] = gs0[1] + ls01
     if cutlass.const_expr(two):
         gs1[0] = gs1[0] + ls10
         gs1[1] = gs1[1] + ls11
-    gm0[0] = ngm00
-    gm0[1] = ngm01
-    if cutlass.const_expr(two):
-        gm1[0] = ngm10
-        gm1[1] = ngm11
     return (
         p0,
         p1,
@@ -919,21 +1396,30 @@ def s4_finalize_row_sum_mg2(
     num_threads: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
 ):
     """Final cross-warp row-sum reduction for deferred MG softmax. Group-1
     statements gate inline behind ``const_expr(n_hg == 2)`` (n_hg==2 trace
     unchanged); n_hg==1 reduces only group 0 (tid_flat < hpb)."""
     two = cutlass.const_expr(n_hg == 2)
+    hi0 = cutlass.const_expr(valid_hpb > 8)
+    reduce_heads = cutlass.const_expr(n_hg * hpb if n_hg == 2 else valid_hpb)
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
 
+    # The sum scratch still holds the persistent max that the caller's
+    # final_gmax reads consume; every warp must finish those reads before the
+    # stores below reuse the region (racecheck-confirmed hazard otherwise).
+    cute.arch.barrier(**bar_kw)
+
     if tid == Int32(0):
         st_shared_f32(reduce0_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs0[0])
-        st_shared_f32(
-            reduce0_sum_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
-            gs0[1],
-        )
+        if cutlass.const_expr(hi0):
+            st_shared_f32(
+                reduce0_sum_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
+                gs0[1],
+            )
         if cutlass.const_expr(two):
             st_shared_f32(reduce1_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), gs1[0])
             st_shared_f32(
@@ -942,9 +1428,13 @@ def s4_finalize_row_sum_mg2(
             )
     cute.arch.barrier(**bar_kw)
 
-    if tid_flat < Int32(n_hg * hpb):
-        group = tid_flat // Int32(hpb)
-        h = tid_flat - group * Int32(hpb)
+    if tid_flat < Int32(reduce_heads):
+        if cutlass.const_expr(two):
+            group = tid_flat // Int32(hpb)
+            h = tid_flat - group * Int32(hpb)
+        else:
+            group = Int32(0)
+            h = tid_flat
         rsum = reduce0_sum_addr
         if cutlass.const_expr(two):
             if group != Int32(0):
@@ -958,7 +1448,8 @@ def s4_finalize_row_sum_mg2(
     cute.arch.barrier(**bar_kw)
 
     gs0[0] = ld_shared_f32(reduce0_sum_addr + gid * Int32(4))
-    gs0[1] = ld_shared_f32(reduce0_sum_addr + (gid + Int32(8)) * Int32(4))
+    if cutlass.const_expr(hi0):
+        gs0[1] = ld_shared_f32(reduce0_sum_addr + (gid + Int32(8)) * Int32(4))
     if cutlass.const_expr(two):
         gs1[0] = ld_shared_f32(reduce1_sum_addr + gid * Int32(4))
         gs1[1] = ld_shared_f32(reduce1_sum_addr + (gid + Int32(8)) * Int32(4))
@@ -975,8 +1466,6 @@ def s6_xv_nope_mg_dsv4(
     kv_sc_base_addr: Int32,
     w_head_sc_view: cute.Tensor,
     w_fp8_base_addr: Int32,
-    sm_p_g0_addr: Int32,
-    sm_p_g1_addr: Int32,
     warp_id: Int32,
     lane: Int32,
     tid_flat: Int32,
@@ -1014,38 +1503,6 @@ def s6_xv_nope_mg_dsv4(
     warp_first_cand = warp_id * Int32(8)
     cand_e0 = warp_first_cand + tid * Int32(2)
     cand_e1 = cand_e0 + Int32(1)
-    group_sc_elems = Int32(n_v_chunks * hpb)
-
-    st_shared_bf16_from_f32(
-        sm_p_g0_addr + (gid * Int32(bi) + cand_e0) * Int32(2), w_pre0[0]
-    )
-    st_shared_bf16_from_f32(
-        sm_p_g0_addr + (gid * Int32(bi) + cand_e1) * Int32(2), w_pre0[1]
-    )
-    st_shared_bf16_from_f32(
-        sm_p_g0_addr + ((gid + Int32(8)) * Int32(bi) + cand_e0) * Int32(2),
-        w_pre0[2],
-    )
-    st_shared_bf16_from_f32(
-        sm_p_g0_addr + ((gid + Int32(8)) * Int32(bi) + cand_e1) * Int32(2),
-        w_pre0[3],
-    )
-    if cutlass.const_expr(two):
-        st_shared_bf16_from_f32(
-            sm_p_g1_addr + (gid * Int32(bi) + cand_e0) * Int32(2), w_pre1[0]
-        )
-        st_shared_bf16_from_f32(
-            sm_p_g1_addr + (gid * Int32(bi) + cand_e1) * Int32(2), w_pre1[1]
-        )
-        st_shared_bf16_from_f32(
-            sm_p_g1_addr + ((gid + Int32(8)) * Int32(bi) + cand_e0) * Int32(2),
-            w_pre1[2],
-        )
-        st_shared_bf16_from_f32(
-            sm_p_g1_addr + ((gid + Int32(8)) * Int32(bi) + cand_e1) * Int32(2),
-            w_pre1[3],
-        )
-
     i = tid_flat
     while i < Int32(n_hg * n_v_chunks * hpb):
         w_head_sc_view[i] = Float32(0.0)
@@ -1053,29 +1510,60 @@ def s6_xv_nope_mg_dsv4(
     cute.arch.barrier(**bar_kw)
 
     w_head_sc_base = shared_ptr_to_u32(w_head_sc_view.iterator)
+    w_head_sc_lane_base = w_head_sc_base + gid * Int32(4)
+    # Match the native MG schedule: each lane owns the same two candidate
+    # scales for both head groups, and those scales are reused by the absmax
+    # pass and the W-quantization pass.  Keep the 2*N_V_CHUNKS values live once
+    # instead of reloading/re-expanding the shared UE8M0 bytes in each pass.
+    # The one-CTA launch bound above makes this long-lived cache part of the
+    # math-warp register budget rather than forcing it into local memory.
+    vsc_cache0 = []
+    vsc_cache1 = []
+    vsc_e0_base = kv_sc_base_addr + cand_e0 * Int32(scale_bytes_per_token)
+    # e0/e1 are adjacent scale rows (8 bytes each), and e0 is even, so one
+    # aligned 16-byte load fetches both candidates exactly as FI's
+    # ``ld.shared.v4.b32`` + ``prmt`` sequence does.
+    sc0_lo, sc0_hi, sc1_lo, sc1_hi = ld_shared_v4_u32(vsc_e0_base)
     for vc in cutlass.range_constexpr(n_v_chunks):
-        vsc0 = _ue8m0_byte_to_fp32(
-            _ld_u8_zext(kv_sc_base_addr, cand_e0 * Int32(scale_bytes_per_token) + Int32(vc))
+        if cutlass.const_expr(vc < 4):
+            sc0_word = sc0_lo
+            sc1_word = sc1_lo
+            sc_byte = vc
+        else:
+            sc0_word = sc0_hi
+            sc1_word = sc1_hi
+            sc_byte = vc - 4
+        selector = Int32(0x7770 + sc_byte)
+        vsc_cache0.append(
+            _ue8m0_zext_byte_to_fp32(byte_perm(sc0_word, Uint32(0), selector))
         )
-        vsc1 = _ue8m0_byte_to_fp32(
-            _ld_u8_zext(kv_sc_base_addr, cand_e1 * Int32(scale_bytes_per_token) + Int32(vc))
+        vsc_cache1.append(
+            _ue8m0_zext_byte_to_fp32(byte_perm(sc1_word, Uint32(0), selector))
         )
-        m00 = fmax_f32(fabs_f32(w_pre0[0] * vsc0), fabs_f32(w_pre0[1] * vsc1))
-        m01 = fmax_f32(fabs_f32(w_pre0[2] * vsc0), fabs_f32(w_pre0[3] * vsc1))
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        vsc0 = vsc_cache0[vc]
+        vsc1 = vsc_cache1[vc]
+        m00 = fmax_f32(w_pre0[0] * vsc0, w_pre0[1] * vsc1)
+        m01 = fmax_f32(w_pre0[2] * vsc0, w_pre0[3] * vsc1)
         if cutlass.const_expr(two):
-            m10 = fmax_f32(fabs_f32(w_pre1[0] * vsc0), fabs_f32(w_pre1[1] * vsc1))
-            m11 = fmax_f32(fabs_f32(w_pre1[2] * vsc0), fabs_f32(w_pre1[3] * vsc1))
+            m10 = fmax_f32(w_pre1[0] * vsc0, w_pre1[1] * vsc1)
+            m11 = fmax_f32(w_pre1[2] * vsc0, w_pre1[3] * vsc1)
         vc_base = Int32(vc) * Int32(hpb)
-        atomic_max_shared_f32(w_head_sc_base + (vc_base + gid) * Int32(4), m00)
-        atomic_max_shared_f32(
-            w_head_sc_base + (vc_base + gid + Int32(8)) * Int32(4), m01
+        atomic_max_shared_f32_offset(
+            w_head_sc_lane_base, vc * hpb * 4, m00
+        )
+        atomic_max_shared_f32_offset(
+            w_head_sc_lane_base, (vc * hpb + 8) * 4, m01
         )
         if cutlass.const_expr(two):
-            atomic_max_shared_f32(
-                w_head_sc_base + (group_sc_elems + vc_base + gid) * Int32(4), m10
+            atomic_max_shared_f32_offset(
+                w_head_sc_lane_base,
+                (n_v_chunks * hpb + vc * hpb) * 4,
+                m10,
             )
-            atomic_max_shared_f32(
-                w_head_sc_base + (group_sc_elems + vc_base + gid + Int32(8)) * Int32(4),
+            atomic_max_shared_f32_offset(
+                w_head_sc_lane_base,
+                (n_v_chunks * hpb + vc * hpb + 8) * 4,
                 m11,
             )
     cute.arch.barrier(**bar_kw)
@@ -1106,23 +1594,27 @@ def s6_xv_nope_mg_dsv4(
         w_fp8_g0 = w_fp8_parity_addr
         w_fp8_g1 = w_fp8_parity_addr + Int32(w_fp8_group_stride)
 
-        sc00 = w_head_sc_view[vc_base + gid]
-        sc01 = w_head_sc_view[vc_base + gid + Int32(8)]
+        sc00 = ld_shared_f32_offset(w_head_sc_lane_base, vc * hpb * 4)
+        sc01 = ld_shared_f32_offset(
+            w_head_sc_lane_base, (vc * hpb + 8) * 4
+        )
         if cutlass.const_expr(two):
-            sc10 = w_head_sc_view[group_sc_elems + vc_base + gid]
-            sc11 = w_head_sc_view[group_sc_elems + vc_base + gid + Int32(8)]
-        si00 = Float32(1.0) / sc00
-        si01 = Float32(1.0) / sc01
+            sc10 = ld_shared_f32_offset(
+                w_head_sc_lane_base,
+                (n_v_chunks * hpb + vc * hpb) * 4,
+            )
+            sc11 = ld_shared_f32_offset(
+                w_head_sc_lane_base,
+                (n_v_chunks * hpb + vc * hpb + 8) * 4,
+            )
+        si00 = rcp_approx_ftz(sc00)
+        si01 = rcp_approx_ftz(sc01)
         if cutlass.const_expr(two):
-            si10 = Float32(1.0) / sc10
-            si11 = Float32(1.0) / sc11
+            si10 = rcp_approx_ftz(sc10)
+            si11 = rcp_approx_ftz(sc11)
 
-        vsc0 = _ue8m0_byte_to_fp32(
-            _ld_u8_zext(kv_sc_base_addr, cand_e0 * Int32(scale_bytes_per_token) + Int32(vc))
-        )
-        vsc1 = _ue8m0_byte_to_fp32(
-            _ld_u8_zext(kv_sc_base_addr, cand_e1 * Int32(scale_bytes_per_token) + Int32(vc))
-        )
+        vsc0 = vsc_cache0[vc]
+        vsc1 = vsc_cache1[vc]
 
         # W (A-operand) store rows. FI stores at wrow0=gid, wrow1=gid+8 and, for
         # the dual pbs_extra==2 path, applies the bank-conflict swizzle row^(row>>3)
@@ -1137,38 +1629,30 @@ def s6_xv_nope_mg_dsv4(
             r0 = gid
             r8 = gid + Int32(8)
 
-        st_shared_u8(
+        quantize_scaled_store_shared_v2_e4m3(
             w_fp8_g0 + r0 * Int32(w_fp8_stride) + cand_e0,
-            _quant_e4m3_byte(w_pre0[0] * vsc0 * si00).to(cutlass.Uint8),
+            w_pre0[0] * vsc0,
+            w_pre0[1] * vsc1,
+            si00,
         )
-        st_shared_u8(
-            w_fp8_g0 + r0 * Int32(w_fp8_stride) + cand_e1,
-            _quant_e4m3_byte(w_pre0[1] * vsc1 * si00).to(cutlass.Uint8),
-        )
-        st_shared_u8(
+        quantize_scaled_store_shared_v2_e4m3(
             w_fp8_g0 + r8 * Int32(w_fp8_stride) + cand_e0,
-            _quant_e4m3_byte(w_pre0[2] * vsc0 * si01).to(cutlass.Uint8),
-        )
-        st_shared_u8(
-            w_fp8_g0 + r8 * Int32(w_fp8_stride) + cand_e1,
-            _quant_e4m3_byte(w_pre0[3] * vsc1 * si01).to(cutlass.Uint8),
+            w_pre0[2] * vsc0,
+            w_pre0[3] * vsc1,
+            si01,
         )
         if cutlass.const_expr(two):
-            st_shared_u8(
+            quantize_scaled_store_shared_v2_e4m3(
                 w_fp8_g1 + r0 * Int32(w_fp8_stride) + cand_e0,
-                _quant_e4m3_byte(w_pre1[0] * vsc0 * si10).to(cutlass.Uint8),
+                w_pre1[0] * vsc0,
+                w_pre1[1] * vsc1,
+                si10,
             )
-            st_shared_u8(
-                w_fp8_g1 + r0 * Int32(w_fp8_stride) + cand_e1,
-                _quant_e4m3_byte(w_pre1[1] * vsc1 * si10).to(cutlass.Uint8),
-            )
-            st_shared_u8(
+            quantize_scaled_store_shared_v2_e4m3(
                 w_fp8_g1 + r8 * Int32(w_fp8_stride) + cand_e0,
-                _quant_e4m3_byte(w_pre1[2] * vsc0 * si11).to(cutlass.Uint8),
-            )
-            st_shared_u8(
-                w_fp8_g1 + r8 * Int32(w_fp8_stride) + cand_e1,
-                _quant_e4m3_byte(w_pre1[3] * vsc1 * si11).to(cutlass.Uint8),
+                w_pre1[2] * vsc0,
+                w_pre1[3] * vsc1,
+                si11,
             )
         cute.arch.barrier(**bar_kw)
 
@@ -1238,6 +1722,8 @@ class UnifiedPrefillMGKernel:
         extra_indices_stride0=0,
         row_xor=False,
         head_offset=0,
+        valid_hpb=None,
+        pack_hilo_rows=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -1270,6 +1756,8 @@ class UnifiedPrefillMGKernel:
         self.extra_indices_stride_row = int(extra_indices_stride0)
         self.row_xor = bool(row_xor)
         self.head_offset = int(head_offset)
+        self.valid_hpb = int(traits.hpb if valid_hpb is None else valid_hpb)
+        self.pack_hilo_rows = bool(pack_hilo_rows)
         # MG head-group count (1 for heads==16, 2 for heads % 32 == 0). Derived
         # from the layout (heads_per_cta // hpb) and threaded as a compile-time
         # const so every group-1 op const_expr-elides for n_hg==1.
@@ -1305,6 +1793,13 @@ class UnifiedPrefillMGKernel:
         ).launch(
             grid=(num_tokens * Int32(self.replicate_h), 1, 1),
             block=[self.block_threads, 1, 1],
+            # This is a one-CTA/SM warp-specialized kernel.  Emit the same
+            # launch bound as the native implementation so ptxas can honor the
+            # IO-warp setmaxnreg.dec / math-warp setmaxnreg.inc contract instead
+            # of imposing the 384-thread static ~168-register ceiling on every
+            # warp.  The bound is compile-time metadata and does not affect
+            # graph capture or replay state.
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
@@ -1351,6 +1846,7 @@ class UnifiedPrefillMGKernel:
         ).launch(
             grid=(num_tokens * Int32(self.replicate_h), 1, 1),
             block=[self.block_threads, 1, 1],
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
@@ -1459,6 +1955,12 @@ class UnifiedPrefillMGKernel:
         head_base = Int32(self.head_offset) + h_tile * Int32(L.heads_per_cta)
 
         bf16_qk = cutlass.const_expr(t.compute_mode == ComputeMode.BF16)
+        # Keep BF16 Q-RoPE resident in registers for every MG regime, matching
+        # the native kernel.  The one-CTA launch bound gives math warps the
+        # intended dynamic register budget, so the old SWA/C128 shared-memory
+        # restore specialization is no longer needed.  This remains a fully
+        # compile-time choice with no graph-replay state or allocation.
+        reload_bf16_qrope = cutlass.const_expr(False)
         # GLM (ARBITRARY_FP32) const_expr arm: post-MMA fp32 QK scale, GLM 2-pass
         # W XV, V==nope (no XV-rope), 656/528 KV geometry, KV-rope from global/L2,
         # Q-rope registerized (aliased onto W_FP8). DSV4 is the scale_format==0 /
@@ -1476,18 +1978,15 @@ class UnifiedPrefillMGKernel:
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
         reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
         w_fp8_addr = shared_ptr_to_u32(st.w_fp8.data_ptr())
-        # GLM reads KV-rope from global/L2 (no sm_p_full XV-rope), so sm_p_full is
-        # DSV4-only; GLM has no kv_sc footer (inline scales). Both have a 0 addr.
+        # GLM has no kv_sc footer (its fp32 scales are inline).  DSV4 stages
+        # XV-RoPE weights into the W_FP8 region after XV-NoPE consumes it.
         if cutlass.const_expr(is_glm):
             kv_sc_addr = Int32(0)
-            sm_p_full_addr = Int32(0)
         else:
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
-            sm_p_full_addr = shared_ptr_to_u32(st.sm_p_full.data_ptr())
 
         if cutlass.const_expr(bf16_qk):
-            # BF16: Q-NoPE is a single bf16 buffer; the FP8 q_fp8/q_sc do not
-            # exist. Q-rope scratch ALIASES the W_FP8 region (S0-only).
+            # BF16 Q-RoPE scratch aliases W_FP8 and is reloaded between tiles.
             q_nope_bf16_addr = shared_ptr_to_u32(st.q_nope_bf16.data_ptr())
             q_fp8_addr = Int32(0)
             q_rope_addr = w_fp8_addr
@@ -1504,9 +2003,6 @@ class UnifiedPrefillMGKernel:
             q_sc_view_all = st.q_sc.get_tensor(cute.make_layout(int(L.q_sc_bytes // 4)))
 
         amax_view = st.reduce.get_tensor(cute.make_layout(int(L.reduce_group_bytes // 4)))
-        token_idx_view_all = st.token_idx.get_tensor(
-            cute.make_layout(int(L.token_idx_buf_bytes * L.token_idx_bufs // 4))
-        )
         w_head_sc_view_all = st.w_head_sc.get_tensor(
             cute.make_layout(int(L.w_head_sc_bytes // 4))
         )
@@ -1515,7 +2011,6 @@ class UnifiedPrefillMGKernel:
 
         kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
         kv_sc_buf = Int32(L.kv_sc_buf_bytes)
-        tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
 
         q_fp8_g0 = q_fp8_addr
         q_fp8_g1 = q_fp8_addr + Int32(L.q_fp8_group_bytes)
@@ -1525,10 +2020,6 @@ class UnifiedPrefillMGKernel:
         q_nope_bf16_g1 = q_nope_bf16_addr + Int32(L.q_nope_bf16_group_bytes)
         reduce_g0 = reduce_addr
         reduce_g1 = reduce_addr + Int32(L.reduce_group_bytes)
-        w_fp8_g0 = w_fp8_addr
-        w_fp8_g1 = w_fp8_addr + Int32(L.w_fp8_group_bytes)
-        sm_p_g0 = sm_p_full_addr
-        sm_p_g1 = sm_p_full_addr + Int32(L.sm_p_full_group_bytes)
         # GLM calls the per-group decode s6_xv_nope, which expects a CONTIGUOUS
         # per-group W_FP8 double-buffer [parity0(hpb)][parity1(hpb)] addressed by
         # ``(vc&1)*hpb*w_fp8_stride``. So each GLM group gets its own
@@ -1558,6 +2049,17 @@ class UnifiedPrefillMGKernel:
         if tid == Int32(0):
             for s in cutlass.range_constexpr(n_buf):
                 cute.arch.mbarrier_init(mbar_base + s, Int32(1))
+        # Persistent online-softmax max lives in the row-sum scratch while the
+        # tile loop is active. The final sum reduction reuses this region only
+        # after every lane has loaded its final max for the epilogue.
+        if tid < Int32(n_hg * t.hpb):
+            m_group = tid // Int32(t.hpb)
+            m_head = tid - m_group * Int32(t.hpb)
+            m_base = reduce_g0 + Int32(L.reduce_warp_sum_group_off)
+            if cutlass.const_expr(n_hg == 2):
+                if m_group != Int32(0):
+                    m_base = reduce_g1 + Int32(L.reduce_warp_sum_group_off)
+            st_shared_f32(m_base + m_head * Int32(4), Float32(-1e30))
         cute.arch.barrier()
 
         section_len = Int32(topk_length[token_idx])
@@ -1618,6 +2120,7 @@ class UnifiedPrefillMGKernel:
         if is_io:
             cute.arch.setmaxregister_decrease(_IO_REGS)
             io_lane = tid - Int32(self.math_threads)
+            kv_l2_policy = create_l2_evict_first_policy()
 
             # PROLOGUE: gather tile 0. For has_extra the launcher ASSERTs
             # num_main_tiles>=1 (topk==128 => 2), so tile 0 is ALWAYS the MAIN
@@ -1627,21 +2130,18 @@ class UnifiedPrefillMGKernel:
                 g_end0 = Int32(_CAND_WINDOW)
                 if g_end0 > section_len:
                     g_end0 = section_len
-                tok0 = cute.make_tensor(
-                    token_idx_view_all.iterator, cute.make_layout(int(L.token_idx_buf_bytes // 4))
-                )
                 if cutlass.const_expr(is_glm):
                     io_issue_gather_glm_mg(
                         kv_cache_u8,
                         topk_row,
                         kv_fp8_addr,
-                        tok0,
                         mbar_base,
                         Int32(0),
                         g_end0,
                         Int32(self.page_block_size),
                         stride_kv_block,
                         io_lane,
+                        kv_l2_policy,
                         bi=t.bi,
                         kv_smem_stride=L.kv_smem_stride,
                         io_threads=_PREFILL_IO_THREADS,
@@ -1652,13 +2152,13 @@ class UnifiedPrefillMGKernel:
                         topk_row,
                         kv_fp8_addr,
                         kv_sc_addr,
-                        tok0,
                         mbar_base,
                         Int32(0),
                         g_end0,
                         Int32(self.page_block_size),
                         stride_kv_block,
                         io_lane,
+                        kv_l2_policy,
                         bi=t.bi,
                         kv_smem_stride=L.kv_smem_stride,
                         io_threads=_PREFILL_IO_THREADS,
@@ -1668,10 +2168,6 @@ class UnifiedPrefillMGKernel:
                 next_lc = Int32(lc) + Int32(1)
                 if next_lc < loop_tiles:
                     buf = next_lc & Int32(1)
-                    tok_buf_view = cute.make_tensor(
-                        token_idx_view_all.iterator + buf * tok_buf_elems,
-                        cute.make_layout(int(L.token_idx_buf_bytes // 4)),
-                    )
                     # Per-tile section dispatch (DSV4 dual-cache). The OUTER guard
                     # is const_expr(has_extra) so the whole dual arm is compile-time
                     # elided when not has_extra -> the no-extra `else` branch traces
@@ -1693,13 +2189,13 @@ class UnifiedPrefillMGKernel:
                                 extra_row,
                                 kv_fp8_addr + buf * kv_fp8_buf,
                                 kv_sc_addr + buf * kv_sc_buf,
-                                tok_buf_view,
                                 mbar_base + buf,
                                 g_start,
                                 g_end,
                                 Int32(self.pbs_extra),
                                 stride_extra_kv_block,
                                 io_lane,
+                                kv_l2_policy,
                                 bi=t.bi,
                                 kv_smem_stride=L.kv_smem_stride,
                                 io_threads=_PREFILL_IO_THREADS,
@@ -1714,13 +2210,13 @@ class UnifiedPrefillMGKernel:
                                 topk_row,
                                 kv_fp8_addr + buf * kv_fp8_buf,
                                 kv_sc_addr + buf * kv_sc_buf,
-                                tok_buf_view,
                                 mbar_base + buf,
                                 g_start,
                                 g_end,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
                                 io_lane,
+                                kv_l2_policy,
                                 bi=t.bi,
                                 kv_smem_stride=L.kv_smem_stride,
                                 io_threads=_PREFILL_IO_THREADS,
@@ -1735,13 +2231,13 @@ class UnifiedPrefillMGKernel:
                                 kv_cache_u8,
                                 topk_row,
                                 kv_fp8_addr + buf * kv_fp8_buf,
-                                tok_buf_view,
                                 mbar_base + buf,
                                 g_start,
                                 g_end,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
                                 io_lane,
+                                kv_l2_policy,
                                 bi=t.bi,
                                 kv_smem_stride=L.kv_smem_stride,
                                 io_threads=_PREFILL_IO_THREADS,
@@ -1752,13 +2248,13 @@ class UnifiedPrefillMGKernel:
                                 topk_row,
                                 kv_fp8_addr + buf * kv_fp8_buf,
                                 kv_sc_addr + buf * kv_sc_buf,
-                                tok_buf_view,
                                 mbar_base + buf,
                                 g_start,
                                 g_end,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
                                 io_lane,
+                                kv_l2_policy,
                                 bi=t.bi,
                                 kv_smem_stride=L.kv_smem_stride,
                                 io_threads=_PREFILL_IO_THREADS,
@@ -1769,9 +2265,10 @@ class UnifiedPrefillMGKernel:
             cute.arch.setmaxregister_increase(_MATH_REGS)
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
             if cutlass.const_expr(bf16_qk):
-                # S0 (BF16): load Q-NoPE straight to bf16 smem + Q-rope to the
-                # aliased scratch, then preload Q-rope A operands to registers so
-                # the scratch can be overwritten by W_FP8 in S6.
+                # S0 (BF16): stage Q-NoPE and Q-RoPE in shared memory.  The
+                # selected specialization either consumes Q-RoPE from this
+                # aliased scratch (restoring it between tiles), or snapshots it
+                # into registers once before W_FP8 takes over the same storage.
                 s0_load_q_bf16_to_smem_mg(
                     q_token,
                     q_nope_bf16_g0,
@@ -1784,18 +2281,46 @@ class UnifiedPrefillMGKernel:
                     d_rope=t.d_rope,
                     hpb=t.hpb,
                     q_nope_bf16_stride=L.q_nope_bf16_stride,
+                    q_rope_stride=L.q_rope_stride,
                     num_threads=self.math_threads,
                     barrier_id=2,
                     n_hg=n_hg,
+                    valid_hpb=self.valid_hpb,
                 )
-                q_rope_regs0 = preload_q_rope_regs_mg(q_rope_g0, lane, d_rope=t.d_rope)
-                if cutlass.const_expr(n_hg == 2):
-                    q_rope_regs1 = preload_q_rope_regs_mg(q_rope_g1, lane, d_rope=t.d_rope)
-                else:
-                    q_rope_regs1 = q_rope_regs0  # never read when n_hg==1.
-                # Math/IO sync so the W_FP8 region (aliased Q-rope scratch) is free
-                # for S6 once every math lane has its Q-rope regs.
-                cute.arch.barrier(barrier_id=2, number_of_threads=self.math_threads)
+                if cutlass.const_expr(not reload_bf16_qrope):
+                    (
+                        q000, q001, q002, q003,
+                        q010, q011, q012, q013,
+                        q020, q021, q022, q023,
+                        q030, q031, q032, q033,
+                    ) = preload_q_rope_regs_mg(
+                        q_rope_g0,
+                        lane,
+                        d_rope=t.d_rope,
+                        q_rope_stride=L.q_rope_stride,
+                    )
+                    if cutlass.const_expr(n_hg == 2):
+                        (
+                            q100, q101, q102, q103,
+                            q110, q111, q112, q113,
+                            q120, q121, q122, q123,
+                            q130, q131, q132, q133,
+                        ) = preload_q_rope_regs_mg(
+                            q_rope_g1,
+                            lane,
+                            d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                        )
+                    else:
+                        # Group 1 is const-expr elided, but bind its scalar
+                        # operands so both specializations trace one function.
+                        q100, q101, q102, q103 = q000, q001, q002, q003
+                        q110, q111, q112, q113 = q010, q011, q012, q013
+                        q120, q121, q122, q123 = q020, q021, q022, q023
+                        q130, q131, q132, q133 = q030, q031, q032, q033
+                    cute.arch.barrier(
+                        barrier_id=2, number_of_threads=self.math_threads
+                    )
             else:
                 s0_quantize_q_to_smem(
                     q_token,
@@ -1804,7 +2329,7 @@ class UnifiedPrefillMGKernel:
                     q_rope_g0,
                     amax_view,
                     head_base,
-                    Int32(t.hpb),
+                    Int32(self.valid_hpb),
                     tid,
                     d_nope=t.d_nope,
                     d_rope=t.d_rope,
@@ -1813,6 +2338,7 @@ class UnifiedPrefillMGKernel:
                     num_scales=t.num_scales,
                     hpb=t.hpb,
                     q_nope_stride=t.q_nope_stride,
+                    q_rope_stride=L.q_rope_stride,
                     num_threads=self.math_threads,
                     barrier_id=2,
                 )
@@ -1833,6 +2359,7 @@ class UnifiedPrefillMGKernel:
                         num_scales=t.num_scales,
                         hpb=t.hpb,
                         q_nope_stride=t.q_nope_stride,
+                        q_rope_stride=L.q_rope_stride,
                         num_threads=self.math_threads,
                         barrier_id=2,
                     )
@@ -1841,9 +2368,19 @@ class UnifiedPrefillMGKernel:
                     # only live in S0/XV-free): preload the bf16 Q-rope A operands
                     # to registers, then sync so W_FP8 is free for S6 -- exactly
                     # like the BF16 path. DSV4 FP8 keeps Q-rope in smem (no preload).
-                    q_rope_regs0 = preload_q_rope_regs_mg(q_rope_g0, lane, d_rope=t.d_rope)
+                    q_rope_regs0 = preload_q_rope_regs_mg(
+                        q_rope_g0,
+                        lane,
+                        d_rope=t.d_rope,
+                        q_rope_stride=L.q_rope_stride,
+                    )
                     if cutlass.const_expr(n_hg == 2):
-                        q_rope_regs1 = preload_q_rope_regs_mg(q_rope_g1, lane, d_rope=t.d_rope)
+                        q_rope_regs1 = preload_q_rope_regs_mg(
+                            q_rope_g1,
+                            lane,
+                            d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                        )
                     else:
                         q_rope_regs1 = q_rope_regs0  # never read when n_hg==1.
                     cute.arch.barrier(barrier_id=2, number_of_threads=self.math_threads)
@@ -1852,8 +2389,6 @@ class UnifiedPrefillMGKernel:
             acc1_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
             rope0_frag = cute.make_rmem_tensor(4, Float32)
             rope1_frag = cute.make_rmem_tensor(4, Float32)
-            gmax0_frag = cute.make_rmem_tensor(2, Float32)
-            gmax1_frag = cute.make_rmem_tensor(2, Float32)
             gsum0_frag = cute.make_rmem_tensor(2, Float32)
             gsum1_frag = cute.make_rmem_tensor(2, Float32)
             for k in cutlass.range_constexpr(n_acc_tiles * 4):
@@ -1862,10 +2397,6 @@ class UnifiedPrefillMGKernel:
             for k in cutlass.range_constexpr(4):
                 rope0_frag[k] = Float32(0.0)
                 rope1_frag[k] = Float32(0.0)
-            gmax0_frag[0] = Float32(-1e30)
-            gmax0_frag[1] = Float32(-1e30)
-            gmax1_frag[0] = Float32(-1e30)
-            gmax1_frag[1] = Float32(-1e30)
             gsum0_frag[0] = Float32(0.0)
             gsum0_frag[1] = Float32(0.0)
             gsum1_frag[0] = Float32(0.0)
@@ -1903,18 +2434,17 @@ class UnifiedPrefillMGKernel:
                 buf = ci & Int32(1)
                 kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
                 kv_sc_b = kv_sc_addr + buf * kv_sc_buf
-                tok_buf_view = cute.make_tensor(
-                    token_idx_view_all.iterator + buf * tok_buf_elems,
-                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
-                )
-                # MAIN rope geometry (used by the FP8 / GLM QK-rope arms, which are
-                # never on the dual path). The DSV4 BF16 QK-rope (s2) + XV-rope (s6b)
-                # do their OWN per-tile section dispatch below (a const_expr(has_extra)
-                # dynamic if/else that calls the rope helper with the EXTRA tensor in
-                # one arm and the MAIN tensor in the other) -- the cute.Tensor cannot
-                # be re-bound inside a dynamic `if`, so the section switch lives at
-                # the call sites. const_expr(not has_extra) elides the dual arms ->
-                # byte-identical.
+                # Match FI's ``ib``: math reads the selected-index tile directly
+                # from global/L2.  A raw pointer can be selected dynamically for
+                # the dual-cache phase without staging a 64-entry smem copy.
+                index_base_ptr = get_ptr_as_int64(topk_row, split_cand_start)
+                if cutlass.const_expr(has_extra):
+                    if ci >= num_main_tiles:
+                        index_base_ptr = get_ptr_as_int64(
+                            extra_row, split_cand_start
+                        )
+
+                # MAIN rope geometry used by the non-dual FP8 / GLM arms.
                 rope_cache = kv_cache_u8
                 rope_pbs = Int32(self.page_block_size)
                 rope_stride = stride_kv_block
@@ -1929,7 +2459,6 @@ class UnifiedPrefillMGKernel:
                     for at in range(n_acc_tiles)
                 ]
                 rope0 = [rope0_frag[0], rope0_frag[1], rope0_frag[2], rope0_frag[3]]
-                gm0 = [gmax0_frag[0], gmax0_frag[1]]
                 gs0 = [gsum0_frag[0], gsum0_frag[1]]
                 qk0 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                 acc1 = [
@@ -1942,11 +2471,53 @@ class UnifiedPrefillMGKernel:
                     for at in range(n_acc_tiles)
                 ]
                 rope1 = [rope1_frag[0], rope1_frag[1], rope1_frag[2], rope1_frag[3]]
-                gm1 = [gmax1_frag[0], gmax1_frag[1]]
                 gs1 = [gsum1_frag[0], gsum1_frag[1]]
                 qk1 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
 
                 if cutlass.const_expr(bf16_qk):
+                    if cutlass.const_expr(reload_bf16_qrope):
+                        # Tile 0 consumes the S0 copy. S6 overwrites the aliased
+                        # W_FP8 scratch, so restore only the 4 KiB Q-RoPE slice
+                        # for each subsequent tile before issuing its QK work.
+                        if ci > Int32(0):
+                            reload_q_rope_bf16_to_smem_mg(
+                                q_token,
+                                q_rope_g0,
+                                q_rope_g1,
+                                head_base,
+                                tid,
+                                d_nope=t.d_nope,
+                                d_rope=t.d_rope,
+                                q_rope_stride=L.q_rope_stride,
+                                hpb=t.hpb,
+                                num_threads=self.math_threads,
+                                barrier_id=2,
+                                n_hg=n_hg,
+                                valid_hpb=self.valid_hpb,
+                            )
+                    # Match FlashInfer's latency-hiding schedule: issue all
+                    # KV-RoPE global loads before the long NoPE MMA chain, then
+                    # consume the prefetched B operands in S2. The selected raw
+                    # pointer also lets the dual-cache path share one S2 body.
+                    rope_entry = warp_first_cand + (lane >> Int32(2))
+                    rope_idx = _ld_global_index_i32(index_base_ptr, rope_entry)
+                    rope_base = _dsv4_rope_base_off(
+                        rope_idx, Int32(self.page_block_size), stride_kv_block
+                    )
+                    rope_base_ptr = get_ptr_as_int64(kv_cache_u8, rope_base)
+                    if cutlass.const_expr(has_extra):
+                        if ci >= num_main_tiles:
+                            rope_base = _dsv4_rope_base_off(
+                                rope_idx,
+                                Int32(self.pbs_extra),
+                                stride_extra_kv_block,
+                            )
+                            rope_base_ptr = get_ptr_as_int64(
+                                extra_kv_cache_u8, rope_base
+                            )
+                    kv_rope_regs = prefetch_kv_rope_regs_dsv4(
+                        rope_base_ptr, lane, d_rope=t.d_rope
+                    )
                     # BF16-QK: fused two-group bf16 m16n8k16 QK-NoPE with inline
                     # FP8->BF16 K dequant (NO block-scaled FP8 MMA, NO Q-quant).
                     qk0, qk1 = s1_qk_nope_bf16_mg2(
@@ -1965,57 +2536,31 @@ class UnifiedPrefillMGKernel:
                         scale_bytes_per_token=8,
                         n_hg=n_hg,
                     )
-                    # QK-RoPE: Q-rope A from preloaded registers, KV-RoPE B from
-                    # global (gathered once per tile, reused across groups). For the
-                    # DSV4 dual path an EXTRA tile reads KV-rope from the EXTRA cache
-                    # (its pbs/stride); the cute.Tensor cannot be re-bound in a dynamic
-                    # if, so the section switch is a const_expr(has_extra) dynamic
-                    # if/else around the helper call. const_expr(not has_extra) elides
-                    # the dual arm -> a single MAIN call, byte-identical to today.
-                    if cutlass.const_expr(has_extra):
-                        if ci >= num_main_tiles:
-                            qk0, qk1 = s2_qk_rope_regs_mg_dsv4(
-                                qk0,
-                                qk1,
-                                q_rope_regs0,
-                                q_rope_regs1,
-                                extra_kv_cache_u8,
-                                tok_buf_view,
-                                warp_first_cand,
-                                lane,
-                                Int32(self.pbs_extra),
-                                stride_extra_kv_block,
-                                d_rope=t.d_rope,
-                                n_hg=n_hg,
-                            )
-                        else:
-                            qk0, qk1 = s2_qk_rope_regs_mg_dsv4(
-                                qk0,
-                                qk1,
-                                q_rope_regs0,
-                                q_rope_regs1,
-                                kv_cache_u8,
-                                tok_buf_view,
-                                warp_first_cand,
-                                lane,
-                                Int32(self.page_block_size),
-                                stride_kv_block,
-                                d_rope=t.d_rope,
-                                n_hg=n_hg,
-                            )
-                    else:
-                        qk0, qk1 = s2_qk_rope_regs_mg_dsv4(
+                    if cutlass.const_expr(reload_bf16_qrope):
+                        qk0, qk1 = s2_qk_rope_shared_prefetched_mg_dsv4(
                             qk0,
                             qk1,
-                            q_rope_regs0,
-                            q_rope_regs1,
-                            rope_cache,
-                            tok_buf_view,
-                            warp_first_cand,
+                            q_rope_g0,
+                            q_rope_g1,
+                            kv_rope_regs,
                             lane,
-                            rope_pbs,
-                            rope_stride,
                             d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                            n_hg=n_hg,
+                        )
+                    else:
+                        qk0, qk1 = s2_qk_rope_prefetched_mg_dsv4_scalar(
+                            qk0,
+                            qk1,
+                            q000, q001, q002, q003,
+                            q010, q011, q012, q013,
+                            q020, q021, q022, q023,
+                            q030, q031, q032, q033,
+                            q100, q101, q102, q103,
+                            q110, q111, q112, q113,
+                            q120, q121, q122, q123,
+                            q130, q131, q132, q133,
+                            kv_rope_regs,
                             n_hg=n_hg,
                         )
                 else:
@@ -2033,6 +2578,7 @@ class UnifiedPrefillMGKernel:
                         kv_smem_stride=L.kv_smem_stride,
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
+                        valid_hpb=self.valid_hpb,
                     )
                     if cutlass.const_expr(n_hg == 2):
                         qk1 = s1_qk_nope_block_scaled(
@@ -2049,6 +2595,7 @@ class UnifiedPrefillMGKernel:
                             kv_smem_stride=L.kv_smem_stride,
                             scale_bytes_per_token=8,
                             scale_format=t.scale_format,
+                            valid_hpb=t.hpb,
                         )
                     if cutlass.const_expr(is_glm):
                         # GLM QK-RoPE: Q-rope A from preloaded registers, KV-rope B
@@ -2060,13 +2607,14 @@ class UnifiedPrefillMGKernel:
                             q_rope_regs0,
                             q_rope_regs1,
                             rope_cache,
-                            tok_buf_view,
+                            index_base_ptr,
                             warp_first_cand,
                             lane,
                             rope_pbs,
                             rope_stride,
                             d_rope=t.d_rope,
                             n_hg=n_hg,
+                            valid_hpb=self.valid_hpb,
                         )
                     else:
                         # Fused QK-RoPE: KV-RoPE B operand gathered ONCE per CTA tile
@@ -2078,17 +2626,19 @@ class UnifiedPrefillMGKernel:
                             q_rope_g0,
                             q_rope_g1,
                             rope_cache,
-                            tok_buf_view,
+                            index_base_ptr,
                             warp_first_cand,
                             lane,
                             rope_pbs,
                             rope_stride,
                             d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
                             n_hg=n_hg,
+                            valid_hpb=self.valid_hpb,
                         )
-                qk0 = s3_mask_and_scale(
+                qk0 = s3_mask_and_scale_global(
                     qk0,
-                    tok_buf_view,
+                    index_base_ptr,
                     warp_first_cand,
                     split_cand_start,
                     split_cand_end,
@@ -2097,9 +2647,9 @@ class UnifiedPrefillMGKernel:
                     lane,
                 )
                 if cutlass.const_expr(n_hg == 2):
-                    qk1 = s3_mask_and_scale(
+                    qk1 = s3_mask_and_scale_global(
                         qk1,
-                        tok_buf_view,
+                        index_base_ptr,
                         warp_first_cand,
                         split_cand_start,
                         split_cand_end,
@@ -2118,14 +2668,15 @@ class UnifiedPrefillMGKernel:
                     acc1,
                     rope0,
                     rope1,
-                    gm0,
-                    gm1,
                     gs0,
                     gs1,
-                    reduce_g0 + Int32(L.reduce_warp_max_group_off),
-                    reduce_g0 + Int32(L.reduce_warp_sum_group_off),
-                    reduce_g1 + Int32(L.reduce_warp_max_group_off),
-                    reduce_g1 + Int32(L.reduce_warp_sum_group_off),
+                    acc0_frag,
+                    acc1_frag,
+                    rope0_frag,
+                    rope1_frag,
+                    gsum0_frag,
+                    gsum1_frag,
+                    reduce_addr,
                     warp_id,
                     lane,
                     tid,
@@ -2135,7 +2686,10 @@ class UnifiedPrefillMGKernel:
                     num_threads=self.math_threads,
                     barrier_id=3,
                     n_acc_tiles=n_acc_tiles,
+                    reduce_group_bytes=L.reduce_group_bytes,
+                    reduce_sum_off=L.reduce_warp_sum_group_off,
                     n_hg=n_hg,
+                    valid_hpb=self.valid_hpb,
                 )
                 w_pre0 = [p0[0] * wr00, p0[1] * wr00, p0[2] * wr01, p0[3] * wr01]
                 w_pre1 = [p1[0] * wr10, p1[1] * wr10, p1[2] * wr11, p1[3] * wr11]
@@ -2157,10 +2711,22 @@ class UnifiedPrefillMGKernel:
                     # atomicMaxes against uninitialized smem (catastrophic on cold
                     # launch) and later tiles never reset it (stale max bias).
                     i_hs = tid
-                    while i_hs < Int32(n_hg * t.n_v_chunks * t.hpb):
-                        w_head_sc_view_all[i_hs] = Float32(0.0)
+                    while i_hs < Int32(n_hg * t.n_v_chunks * self.valid_hpb):
+                        group_span = Int32(t.n_v_chunks * self.valid_hpb)
+                        g_hs = i_hs // group_span
+                        rem_hs = i_hs - g_hs * group_span
+                        vc_hs = rem_hs // Int32(self.valid_hpb)
+                        h_hs = rem_hs - vc_hs * Int32(self.valid_hpb)
+                        slot_hs = (
+                            g_hs * Int32(t.n_v_chunks * t.hpb)
+                            + vc_hs * Int32(t.hpb)
+                            + h_hs
+                        )
+                        w_head_sc_view_all[slot_hs] = Float32(0.0)
                         i_hs += Int32(self.math_threads)
-                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                    cute.arch.barrier(
+                        barrier_id=3, number_of_threads=self.math_threads
+                    )
                     acc0 = s6_xv_nope(
                         w_pre0,
                         acc0,
@@ -2183,6 +2749,8 @@ class UnifiedPrefillMGKernel:
                         scale_format=t.scale_format,
                         num_threads=self.math_threads,
                         barrier_id=3,
+                        valid_hpb=self.valid_hpb,
+                        pack_hilo_rows=self.pack_hilo_rows,
                     )
                     if cutlass.const_expr(n_hg == 2):
                         acc1 = s6_xv_nope(
@@ -2207,6 +2775,7 @@ class UnifiedPrefillMGKernel:
                             scale_format=t.scale_format,
                             num_threads=self.math_threads,
                             barrier_id=3,
+                            valid_hpb=t.hpb,
                         )
                 else:
                     acc0, acc1 = s6_xv_nope_mg_dsv4(
@@ -2218,8 +2787,6 @@ class UnifiedPrefillMGKernel:
                         kv_sc_b,
                         w_head_sc_view_all,
                         w_fp8_addr,
-                        sm_p_g0,
-                        sm_p_g1,
                         warp_id,
                         lane,
                         tid,
@@ -2248,51 +2815,66 @@ class UnifiedPrefillMGKernel:
                             rope0, rope1 = s6b_xv_rope_global_mg_dsv4(
                                 rope0,
                                 rope1,
-                                sm_p_g0,
-                                sm_p_g1,
+                                w_pre0,
+                                w_pre1,
+                                w_fp8_addr,
                                 extra_kv_cache_u8,
-                                tok_buf_view,
+                                index_base_ptr,
                                 warp_id,
                                 lane,
                                 Int32(self.pbs_extra),
                                 stride_extra_kv_block,
                                 bi=t.bi,
+                                sm_p_stride=L.sm_p_full_stride,
+                                hpb=t.hpb,
                                 d_rope=t.d_rope,
                                 n_warps=8,
+                                num_threads=self.math_threads,
+                                barrier_id=3,
                                 n_hg=n_hg,
                             )
                         else:
                             rope0, rope1 = s6b_xv_rope_global_mg_dsv4(
                                 rope0,
                                 rope1,
-                                sm_p_g0,
-                                sm_p_g1,
+                                w_pre0,
+                                w_pre1,
+                                w_fp8_addr,
                                 kv_cache_u8,
-                                tok_buf_view,
+                                index_base_ptr,
                                 warp_id,
                                 lane,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
                                 bi=t.bi,
+                                sm_p_stride=L.sm_p_full_stride,
+                                hpb=t.hpb,
                                 d_rope=t.d_rope,
                                 n_warps=8,
+                                num_threads=self.math_threads,
+                                barrier_id=3,
                                 n_hg=n_hg,
                             )
                     else:
                         rope0, rope1 = s6b_xv_rope_global_mg_dsv4(
                             rope0,
                             rope1,
-                            sm_p_g0,
-                            sm_p_g1,
+                            w_pre0,
+                            w_pre1,
+                            w_fp8_addr,
                             rope_cache,
-                            tok_buf_view,
+                            index_base_ptr,
                             warp_id,
                             lane,
                             rope_pbs,
                             rope_stride,
                             bi=t.bi,
+                            sm_p_stride=L.sm_p_full_stride,
+                            hpb=t.hpb,
                             d_rope=t.d_rope,
                             n_warps=8,
+                            num_threads=self.math_threads,
+                            barrier_id=3,
                             n_hg=n_hg,
                         )
                 for at in cutlass.range_constexpr(n_acc_tiles):
@@ -2304,8 +2886,6 @@ class UnifiedPrefillMGKernel:
                 rope0_frag[1] = rope0[1]
                 rope0_frag[2] = rope0[2]
                 rope0_frag[3] = rope0[3]
-                gmax0_frag[0] = gm0[0]
-                gmax0_frag[1] = gm0[1]
                 gsum0_frag[0] = gs0[0]
                 gsum0_frag[1] = gs0[1]
                 if cutlass.const_expr(n_hg == 2):
@@ -2318,8 +2898,6 @@ class UnifiedPrefillMGKernel:
                     rope1_frag[1] = rope1[1]
                     rope1_frag[2] = rope1[2]
                     rope1_frag[3] = rope1[3]
-                    gmax1_frag[0] = gm1[0]
-                    gmax1_frag[1] = gm1[1]
                     gsum1_frag[0] = gs1[0]
                     gsum1_frag[1] = gs1[1]
 
@@ -2328,6 +2906,34 @@ class UnifiedPrefillMGKernel:
                 if next_lc < loop_tiles:
                     next_phase = (next_lc >> Int32(1)) & Int32(1)
                     cute.arch.mbarrier_wait(mbar_base + (next_lc & Int32(1)), phase=next_phase)
+
+            final_gid = lane >> Int32(2)
+            final_gmax0 = [
+                ld_shared_f32(
+                    reduce_g0
+                    + Int32(L.reduce_warp_sum_group_off)
+                    + final_gid * Int32(4)
+                ),
+                Float32(-1e30),
+            ]
+            if cutlass.const_expr(self.valid_hpb > 8):
+                final_gmax0[1] = ld_shared_f32(
+                    reduce_g0
+                    + Int32(L.reduce_warp_sum_group_off)
+                    + (final_gid + Int32(8)) * Int32(4)
+                )
+            final_gmax1 = [Float32(-1e30), Float32(-1e30)]
+            if cutlass.const_expr(n_hg == 2):
+                final_gmax1[0] = ld_shared_f32(
+                    reduce_g1
+                    + Int32(L.reduce_warp_sum_group_off)
+                    + final_gid * Int32(4)
+                )
+                final_gmax1[1] = ld_shared_f32(
+                    reduce_g1
+                    + Int32(L.reduce_warp_sum_group_off)
+                    + (final_gid + Int32(8)) * Int32(4)
+                )
 
             if is_empty_row:
                 gsum0_frag[0] = Float32(0.0)
@@ -2351,6 +2957,7 @@ class UnifiedPrefillMGKernel:
                 num_threads=self.math_threads,
                 barrier_id=3,
                 n_hg=n_hg,
+                valid_hpb=self.valid_hpb,
             )
             gsum0_frag[0] = final_sum0[0]
             gsum0_frag[1] = final_sum0[1]
@@ -2373,7 +2980,7 @@ class UnifiedPrefillMGKernel:
                 + token_idx.to(Int64) * Int64(self.output_stride_row)
                 + head_base.to(Int64) * Int64(self.output_stride_head),
                 cute.make_layout(
-                    (t.hpb, t.d_v),
+                    (self.valid_hpb, t.d_v),
                     stride=(self.output_stride_head, self.output_stride_dim),
                 ),
             )
@@ -2381,12 +2988,12 @@ class UnifiedPrefillMGKernel:
                 out_lse.iterator
                 + token_idx.to(Int64) * Int64(self.out_lse_stride_row)
                 + head_base.to(Int64) * Int64(self.out_lse_stride_head),
-                cute.make_layout((t.hpb,), stride=(self.out_lse_stride_head,)),
+                cute.make_layout((self.valid_hpb,), stride=(self.out_lse_stride_head,)),
             )
             s7_epilogue(
                 fin0,
                 rope0,
-                [gmax0_frag[0], gmax0_frag[1]],
+                final_gmax0,
                 [gsum0_frag[0], gsum0_frag[1]],
                 out_o0,
                 out_lse0,
@@ -2397,13 +3004,22 @@ class UnifiedPrefillMGKernel:
                 d_nope=t.d_nope,
                 d_rope=t.d_rope,
                 n_warps=8,
-                valid_hpb=t.hpb,
+                valid_hpb=self.valid_hpb,
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
                 epilogue_mode=EPILOGUE_FINAL_BF16,
                 has_attn_sink=self.has_sink,
                 attn_sink=attn_sink,
                 head_base=head_base,
+                fast_rcp=True,
+                staging_base_addr=kv_fp8_addr,
+                d_v=t.d_v,
+                num_threads=self.math_threads,
+                barrier_id=3,
+                coalesced_output=cutlass.const_expr(
+                    self.output_stride_dim == 1
+                    and self.output_stride_head == t.d_v
+                ),
             )
 
             # Group-1 epilogue: const_expr-elided for n_hg==1 (single-group MG ->
@@ -2442,7 +3058,7 @@ class UnifiedPrefillMGKernel:
                 s7_epilogue(
                     fin1,
                     rope1,
-                    [gmax1_frag[0], gmax1_frag[1]],
+                    final_gmax1,
                     [gsum1_frag[0], gsum1_frag[1]],
                     out_o1,
                     out_lse1,
@@ -2460,6 +3076,15 @@ class UnifiedPrefillMGKernel:
                     has_attn_sink=self.has_sink,
                     attn_sink=attn_sink,
                     head_base=head_base1,
+                    fast_rcp=True,
+                    staging_base_addr=kv_fp8_addr,
+                    d_v=t.d_v,
+                    num_threads=self.math_threads,
+                    barrier_id=3,
+                    coalesced_output=cutlass.const_expr(
+                        self.output_stride_dim == 1
+                        and self.output_stride_head == t.d_v
+                    ),
                 )
 
 
@@ -2510,12 +3135,26 @@ def _sparse_mla_prefill_mg_flat_launch(
             "SM120 sparse MLA MG prefill head range out of bounds: "
             f"head_offset={head_offset}, active_heads={active_heads}, total_heads={total_heads}"
         )
-    if active_heads % heads_per_cta != 0:
+    if active_heads % heads_per_cta == 0:
+        valid_hpb = int(traits.hpb)
+        replicate_h = active_heads // heads_per_cta
+    elif int(mg_n_hg) == 1 and active_heads == int(traits.hpb) // 2:
+        valid_hpb = active_heads
+        replicate_h = 1
+    else:
         raise ValueError(
             "SM120 sparse MLA MG prefill active head range must be divisible by "
-            f"heads_per_cta={heads_per_cta}; got active_heads={active_heads}"
+            f"heads_per_cta={heads_per_cta} (or active_heads==hpb//2 with "
+            f"mg_n_hg==1 for the 8-head shard); got active_heads={active_heads}"
         )
-    replicate_h = active_heads // heads_per_cta
+    pack_hilo_rows = (
+        int(model_type) == int(ModelType.GLM_NSA)
+        and int(scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+        and int(mg_n_hg) == 1
+        and valid_hpb == 8
+        and os.environ.get("B12X_MLA_SM120_PREFILL_PACK_HILO_ROWS", "1")
+        not in ("0", "false", "False", "off")
+    )
     # DSV4 dual-cache MG: the union puts tile 0 in the MAIN section, so
     # num_main_tiles MUST be >= 1 (topk==128 => 2). All-extra (num_main_tiles==0)
     # has no extra-prologue arm and is forbidden.
@@ -2544,6 +3183,8 @@ def _sparse_mla_prefill_mg_flat_launch(
         extra_indices_stride0=int(extra_indices_t.stride(0)),
         row_xor=bool(row_xor),
         head_offset=head_offset,
+        valid_hpb=valid_hpb,
+        pack_hilo_rows=pack_hilo_rows,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     base_args = (
@@ -2577,6 +3218,8 @@ def _sparse_mla_prefill_mg_flat_launch(
         key_field("num_heads", total_heads),
         key_field("heads_per_cta", heads_per_cta),
         key_field("mg_n_hg", int(mg_n_hg)),
+        key_field("valid_hpb", int(valid_hpb)),
+        key_field("pack_hilo_rows", int(pack_hilo_rows)),
         key_field("num_tiles", int(num_tiles)),
         key_field("page_block_size", int(page_block_size)),
         key_field("topk_bucket", _topk_bucket(topk)),
@@ -2868,13 +3511,16 @@ def run_unified_prefill_mg(
         )
     traits = make_unified_traits(model_type, int(compute_mode), scale_format)
     # heads_per_cta = mg_n_hg * HPB. mg_n_hg==2 covers paired head groups; mg_n_hg==1
-    # covers a single-group launch, including the 16-head tail of an odd-multiple
-    # dual-cache split. The caller picks mg_n_hg and active head range.
+    # covers a single-group launch, including 16-head tails and the heads==8
+    # valid_hpb shard. The caller picks mg_n_hg and active head range.
     heads_per_cta = int(mg_n_hg) * int(traits.hpb)
-    if active_heads % heads_per_cta != 0:
+    full_head_tile = active_heads % heads_per_cta == 0
+    valid_hpb_shard = int(mg_n_hg) == 1 and active_heads == int(traits.hpb) // 2
+    if not full_head_tile and not valid_hpb_shard:
         raise ValueError(
             f"SM120 sparse MLA MG prefill (mg_n_hg={mg_n_hg}) requires heads divisible "
-            f"by {heads_per_cta}, got active_heads={active_heads}"
+            f"by {heads_per_cta} (or active_heads==hpb//2 with mg_n_hg==1 for the "
+            f"8-head shard), got active_heads={active_heads}"
         )
 
     topk = int(topk_indices.shape[1])
@@ -2929,7 +3575,7 @@ def run_unified_prefill_mg(
             extra_len_t = extra_topk_length.to(
                 device=device, dtype=torch.int32
             ).contiguous()
-        if active_heads == total_heads and head_offset == 0:
+        if full_head_tile and active_heads == total_heads and head_offset == 0:
             torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
                 q,
                 _cache_base_tensor(kv_cache),
@@ -2990,7 +3636,7 @@ def run_unified_prefill_mg(
             )
         return output, lse_out
 
-    if active_heads == total_heads and head_offset == 0:
+    if full_head_tile and active_heads == total_heads and head_offset == 0:
         torch.ops.b12x.sparse_mla_sm120_prefill_mg(
             q,
             _cache_base_tensor(kv_cache),

@@ -62,7 +62,9 @@ from b12x.attention.indexer.tiled_topk import (
     _smem_st,
     _smem_xadd,
 )
+from b12x.cute.fp4 import ld_shared_f32
 from b12x.attention.indexer.kernel import (
+    _stream_issue_k_page_cp_async,
     _INDEX_HEAD_DIM,
     _PAGE_SIZE,
     _PAGED_Q_HEAD_TILE,
@@ -71,6 +73,8 @@ from b12x.attention.indexer.kernel import (
     _PAGED_WARPS_PER_CTA,
     _WARP_THREADS,
     _compute_mxfp8_tile_partials,
+    _compute_mxfp8_tile_partials_qldm,
+    _stage_q_permuted,
     _load_index_k_page_scalar,
     _num_q_head_tiles,
     _permuted_offset_128b,
@@ -82,6 +86,7 @@ from b12x.cute.fp4 import (
     get_ptr_as_int64,
     ld_global_v4_u32,
     ld_shared_v4_u32,
+    st_shared_u8,
     st_shared_v4_u32,
     threadfence,
 )
@@ -97,25 +102,20 @@ _MAX_CHUNK_ELEMENTS = 8192
 KV_LAYOUT_CONTIGUOUS_MLA = 0
 KV_LAYOUT_PAGED = 1
 
-# Routing is by ROW COUNT, not context width. Under CUDA-graph capture the gate
-# is fixed at capture time, and `width` there is the workspace page-table CAPACITY
-# (constant), not the live seqlen (which varies per step via the seqlens tensor) —
-# so a width gate can't adapt to live context and is the wrong axis. The batch row
-# count IS fixed at capture, so it's the correct gate.
-#
-# Measured HBM-bound (L2-flushed, graph min_us, sm120, heads=64) fused-vs-supertile
-# vs the PRODUCTION chunked supertile (supertile_k=32768, num_chunks=ceil(seq/32k)).
-# Earlier L2-hot single-pass numbers were misleading -- with L2 flushed and supertile
-# chunked realistically, fused wins/ties rows<=6 and the win EXPLODES with context
-# because chunked supertile re-scores per 32k chunk while fused streams once:
-#   rows=1: 256k 0.50x, 128k 0.59x, 64k 0.73x, 32k tie
-#   rows=6: 256k 0.87x, 128k 0.89x, 64k 0.94x, 32k ~tie (topk512 +2us, topk2048 -4us)
-#   rows=8: supertile wins (fused's per-row scoring is HBM-bandwidth-starved at
-#           ctas_per_group=num_sms/rows~=23). So 6 is the cut.
-# Small decode batches with long context are exactly fused's niche; supertile owns
-# larger batches AND prefill (m=q-rows, where fused's m=heads degenerates to 1
-# CTA/row). FUSED_MIN_WIDTH retained only for capacity sizing.
-FUSED_MAX_ROWS = 6           # decode-batch crossover: fused wins rows <= this (HBM-bound)
+# Route metadata is capture-static; live seqlen is deliberately not a policy input,
+# so vLLM graph replay cannot switch backends.  The generic policy retains its
+# measured small-row limit.  C4's heads=64/topk=512 and GLM's heads=32/topk=2048
+# shapes are materially different: production-shape, L2-flushed SM120 measurements
+# show fused winning for every B1-B64 decode bucket.  GLM was measured at 8K, 16K,
+# 32K, and 131K capacity; C4 at 4K, 8K, 16K, and 266K capacity.
+# Prefill remains packed-contiguous and never reaches this decode-only resolver.
+FUSED_MAX_ROWS = 6
+_C4_FUSED_MAX_ROWS = 64
+# GLM re-measured after the two-level tiled fold landed: fused keeps rows 1-16
+# (wins/ties at 8K, dominant at 32K-131K, e.g. r1@131K 41us vs 90us tiled) but
+# loses rows 32-64 everywhere (r64@131K 1541us vs 1043us tiled, r64@8K 100 vs
+# 78) -- the 2-CTAs-per-group merge and one-resident-CTA occupancy starve it.
+_GLM32_FUSED_MAX_ROWS = 16
 FUSED_MIN_WIDTH = 20480      # (capacity-sizing only; no longer a routing gate)
 
 
@@ -300,6 +300,44 @@ _LAST_CTA_MERGE_MAX = 49152
 # too small for coop's grid barriers to ever pay off -- see run_fused_paged_indexer).
 _FORCE_LAST_CTA = 1 << 30
 
+# The fused cooperative merge uses persistent_topk's 772-word state layout.
+# Histograms occupy [0, 768); the fused path uses the two otherwise-generic
+# scalar slots as its candidate-total and end-of-launch cleanup counters.
+_FUSED_STATE_TOTAL = 3 * _RADIX
+_FUSED_STATE_CLEANUP = _FUSED_STATE_TOTAL + 1
+
+
+@cute.jit
+def _load_q_bytes_g2s_v4(
+    q_bytes: cute.Tensor,
+    q_idx: Int32,
+    q_row_stride_bytes: Int64,
+    real_q_bytes: cutlass.Constexpr[int],
+    padded_q_bytes: cutlass.Constexpr[int],
+    q_smem_base_addr: Int32,
+    tx: Int32,
+    n_threads: Int32,
+):
+    """Vectorized 16-byte query staging for the common contiguous-head layout."""
+    linear_vec = tx
+    total_vecs = Int32(int(padded_q_bytes) // 16)
+    real_vecs = Int32(int(real_q_bytes) // 16)
+    row_base = Int64(q_idx) * q_row_stride_bytes
+    while linear_vec < total_vecs:
+        v0 = Uint32(0)
+        v1 = Uint32(0)
+        v2 = Uint32(0)
+        v3 = Uint32(0)
+        if linear_vec < real_vecs:
+            q_addr = get_ptr_as_int64(
+                q_bytes, row_base + Int64(linear_vec) * Int64(16)
+            )
+            v0, v1, v2, v3 = ld_global_v4_u32(q_addr)
+        st_shared_v4_u32(
+            q_smem_base_addr + linear_vec * Int32(16), v0, v1, v2, v3
+        )
+        linear_vec += n_threads
+
 
 def _fused_indexer_state_nbytes(launch: _FusedLaunchConfig) -> int:
     return launch.num_groups * _STATE_WORDS_PER_GROUP * 4
@@ -378,21 +416,30 @@ def resolve_fused_indexer_path(
     topk: int,
     num_rows: int,
     width: int,
+    num_heads: int | None = None,
 ) -> bool:
     """Route to the fused kernel only for small decode batches (rows <= N).
 
-    Routing is by ROW COUNT (fixed at graph-capture), NOT context width: under
-    graph capture `width` is the workspace capacity, not the live seqlen, so it
-    can't distinguish a short live step from a long one. The fused kernel's scorer
-    already beats supertile's, but its parallelism is ctas_per_group = num_sms //
-    rows, which collapses as rows grow — so it only wins the smallest decode
-    batches. Measured at 32k/topk=2048/heads=64 (graph min_us): rows 2/4/8 win
-    (0.91/0.91/0.97x), rows 16/24/32 lose (1.06/1.15/1.23x, growing). Larger
-    batches and all prefill (m=q-rows; fused's m=heads is ~7x slower at T=4096)
-    stay on supertile. width is intentionally ignored for routing.
+    Row count, head count, top-k, and width here are all capture-time workspace
+    metadata; live seqlen is deliberately absent, so the selected route is stable
+    across vLLM CUDA-graph replays. The general small-decode gate remains six
+    rows. C4's 64-head/top-k-512 shape is owned by the streamed tiled route
+    (see the branch below); GLM's 32-head/top-k-2048 shape uses fused through
+    B16 and the streamed tiled route beyond, based on capture-static
+    serving-shape measurements. Prefill is selected before this decode-only
+    resolver and remains packed-contiguous.
     """
     if not supports_fused_indexer(topk=topk, num_rows=num_rows, width=width):
         return False
+    if int(topk) == 512 and num_heads is not None and int(num_heads) == 64:
+        # C4 (DSV4, heads=64/topk=512): the streamed tiled route + two-level
+        # fold retired fused here -- it wins or ties at rows <= 8 across the
+        # measured range and at rows 64 everywhere, leaving fused ahead only
+        # at rows 16 long-K (not enough to keep two production kernels).
+        # GLM's shape below keeps its own measured policy until re-swept.
+        return False
+    if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
+        return int(num_rows) <= _GLM32_FUSED_MAX_ROWS
     return int(num_rows) <= FUSED_MAX_ROWS
 
 
@@ -470,7 +517,36 @@ class FusedIndexerConfig:
 # only to "trim" carry back to topk when it would overflow -> one radix per
 # ~slack/page pages instead of one per page (the dominant cost). Slack is a
 # perf/SMEM knob.
-_BATCH_SLACK = 512
+# The fused scorer is synchronization/instruction limited rather than HBM
+# limited on SM120 (the 64-head DSV4 B32/128K production launch reaches only
+# ~45% DRAM throughput).  Spend the otherwise-idle one-block-per-SM shared-memory
+# headroom on a larger DSV4 carry, batching fifty-two 64-token pages between
+# exact radix trims.  DSV4 serving graphs always have a large static context
+# capacity, so do not create capacity-dependent variants that are unreachable
+# in production.  Other contracts retain the smaller footprint, notably GLM's
+# top-k-2048 specialization, which cannot fit the larger carry.
+# 448 (not 512): the deferred-reduce pipeline's third K stage + partials/scales
+# rings cost ~10KB of SMEM; topk-2048 (GLM) needs 64 fewer carry entries to fit
+# the 101376B SM120 carveout. One trim per ~7 pages instead of 8.
+_BATCH_SLACK = 448
+_DSV4_BATCH_SLACK = 2816
+
+
+def _resolve_fused_batch_slack(
+    *,
+    kv_layout: int,
+    num_heads: int,
+    topk: int,
+) -> int:
+    """Select the capture-static carry batching size for one fused variant."""
+
+    if (
+        int(kv_layout) == KV_LAYOUT_PAGED
+        and int(num_heads) == 64
+        and int(topk) == 512
+    ):
+        return _DSV4_BATCH_SLACK
+    return _BATCH_SLACK
 
 
 @lru_cache(maxsize=64)
@@ -505,8 +581,13 @@ def _fused_indexer_shared_storage_cls(
         "weights": _f32(int(padded_q_heads)),
         "k_page": _u8_page(),
         "k_page_perm": _u8_page(),
-        "scales": _f32(_PAGE_SIZE),
+        "k_page3": _u8_page(),
+        "scales": _f32(4 * _PAGE_SIZE),
+        # Second per-page scale slot: the paged branch ping-pongs K between
+        # k_page_perm (stage 0) and k_page (stage 1, otherwise unused there),
+        # so the scale staging needs a matching second buffer.
         "partial_logits": _f32(int(tokens_per_work) * int(num_q_head_tiles)),
+        "partial_logits2": _f32(int(tokens_per_work) * int(num_q_head_tiles)),
         # --- radix scratch (mirror tiled_topk SharedStorage) ---
         "hist0": _i32(384),
         "hist1": _i32(384),
@@ -894,20 +975,34 @@ class SparseNSAFusedIndexerKernel:
         ctas_per_group: int = 1,
         merge_threshold: int = _LAST_CTA_MERGE_MAX,
         k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
+        k_scales_row_stride: int = _PAGE_SIZE,
+        max_seq_capacity: int = 1 << 30,
+        vectorized_q_load: bool = False,
+        q_row_stride_bytes: int = 0,
     ):
         self.num_heads_static = int(num_heads_static)
         self.topk = int(topk)
         self.kv_layout = int(kv_layout)
         self.ctas_per_group = max(1, int(ctas_per_group))
         self.merge_threshold = int(merge_threshold)
+        self.max_seq_capacity = max(0, int(max_seq_capacity))
+        self.vectorized_q_load = bool(vectorized_q_load)
+        self.q_row_stride_bytes = int(q_row_stride_bytes)
         # dim-0 byte stride of k_quant_bytes for the PAGED wide load. Defaults to
         # the contiguous 8192 (64*128); the packed paged cache interleaves per-page
         # scales so its real page stride is 8448 -- run_fused_paged_indexer passes
         # k_quant_bytes.stride(0) so the load reads the correct page.
         self.k_quant_page_stride = int(k_quant_page_stride)
+        # dim-0 ELEMENT stride of the (pages, 64) f32 scales view: the packed
+        # cache interleaves per-page scales, while standalone scale tensors are
+        # normally contiguous.  Keep this independent from the quant-page byte
+        # stride so both layouts obey their actual tensor contracts.
+        self.k_scales_row_stride = int(k_scales_row_stride)
         if self.kv_layout not in (KV_LAYOUT_CONTIGUOUS_MLA, KV_LAYOUT_PAGED):
             raise ValueError(f"bad kv_layout {self.kv_layout}")
         self.paged_output = bool(paged_output)
+        if self.paged_output and self.kv_layout != KV_LAYOUT_PAGED:
+            raise ValueError("physical-slot output requires the paged K/V layout")
         if self.topk not in _SUPPORTED_TOPK:
             raise ValueError(f"fused indexer supports topk {_SUPPORTED_TOPK}, got {self.topk}")
         self.num_q_head_tiles = _num_q_head_tiles(self.num_heads_static)
@@ -930,8 +1025,16 @@ class SparseNSAFusedIndexerKernel:
         self.page_splits = _PAGE_SIZE // self.tokens_per_work
         self.score_warps = self.token_groups * self.num_q_head_tiles
         self.score_threads = self.score_warps * _WARP_THREADS
-        # Over-sized accumulator: scored tokens append until topk+slack, then trim.
-        self.carry_cap = int(self.topk) + _BATCH_SLACK
+        # Over-sized accumulator: scored tokens append until topk+slack, then
+        # trim.  Keep the large measured slack specific to the paged DSV4
+        # contract so top-k-2048 and contiguous contracts retain their existing
+        # shared-memory residency.
+        batch_slack = _resolve_fused_batch_slack(
+            kv_layout=self.kv_layout,
+            num_heads=self.num_heads_static,
+            topk=self.topk,
+        )
+        self.carry_cap = int(self.topk) + int(batch_slack)
         # The trim radix runs over <= carry_cap elements, so its threshold-bin
         # candidate set is bounded by carry_cap -> size cand0/cand1 to that.
         self.cands = self.carry_cap
@@ -940,6 +1043,9 @@ class SparseNSAFusedIndexerKernel:
         # capacity ctas_per_group * topk; the last-arriving CTA radix-selects the
         # final top-k over the packed reals (no host merge launch).
         self.merge_in_kernel = self.ctas_per_group > 1
+        self.coop_merge_possible = (
+            self.merge_in_kernel and self.max_seq_capacity > self.merge_threshold
+        )
         self.pack_cap = self.ctas_per_group * int(self.topk)
         # Both cross-CTA merge arms are compiled and chosen at runtime per group by
         # seq_len vs merge_threshold (see the merge dispatch). Both index the
@@ -995,6 +1101,10 @@ class SparseNSAFusedIndexerKernel:
             grid=(q_bytes.shape[0] * self.ctas_per_group, 1, 1),
             block=[_RADIX_THREADS, 1, 1],
             smem=SharedStorage.size_in_bytes(),
+            # The 1024-thread radix CTA is architecturally limited to one
+            # resident block on SM120 (1536 threads/SM).  The cooperative
+            # planner also caps the default launch to one machine-wide wave.
+            min_blocks_per_mp=1,
             stream=stream,
         )
 
@@ -1042,8 +1152,10 @@ class SparseNSAFusedIndexerKernel:
             )
         )
         s_w = storage.weights.get_tensor(cute.make_layout((self.padded_q_heads,), stride=(1,)))
+        q_smem_base_addr = shared_ptr_to_u32(storage.q_bytes.data_ptr())
         k_page_base_addr = shared_ptr_to_u32(storage.k_page.data_ptr())
         k_page_perm_base_addr = shared_ptr_to_u32(storage.k_page_perm.data_ptr())
+        k_page3_base_addr = shared_ptr_to_u32(storage.k_page3.data_ptr())
         s_k_page_stage = storage.k_page.get_tensor(
             cute.make_layout(
                 (_PAGE_SIZE, _INDEX_HEAD_DIM, 1),
@@ -1052,6 +1164,12 @@ class SparseNSAFusedIndexerKernel:
         )
         s_scale = storage.scales.get_tensor(cute.make_layout((_PAGE_SIZE,), stride=(1,)))
         s_partial_logits = storage.partial_logits.get_tensor(
+            cute.make_layout(
+                (self.tokens_per_work, self.num_q_head_tiles),
+                stride=(self.num_q_head_tiles, 1),
+            )
+        )
+        s_partial_logits2 = storage.partial_logits2.get_tensor(
             cute.make_layout(
                 (self.tokens_per_work, self.num_q_head_tiles),
                 stride=(self.num_q_head_tiles, 1),
@@ -1103,17 +1221,48 @@ class SparseNSAFusedIndexerKernel:
         # Stage q + weights with all 1024 threads (paid once per CTA; the
         # 128-thread version was 64 sequential byte rounds, costly at short K
         # where per-CTA work is small and CTAs are many).
-        q_linear = tx
-        total_q_bytes = Int32(self.padded_q_heads * _INDEX_HEAD_DIM)
-        while q_linear < total_q_bytes:
-            head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
-            col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
-            s_q[head_idx, col_idx] = (
-                q_bytes[q_idx, head_idx, col_idx]
-                if head_idx < num_heads
-                else cutlass.Uint8(0)
+        # Q staged straight into the ldmatrix-permuted per-head-tile layout so
+        # the score core consumes raw fragments on BOTH operands (no byte
+        # packs, no 16b->8b fragment swizzles).
+        if cutlass.const_expr(self.vectorized_q_load):
+            _stage_q_permuted(
+                q_bytes,
+                q_idx,
+                num_heads,
+                q_smem_base_addr,
+                tx,
+                Int64(self.q_row_stride_bytes),
+                padded_q_heads=self.padded_q_heads,
+                stage_threads=_RADIX_THREADS,
             )
-            q_linear += Int32(_RADIX_THREADS)
+        else:
+            # Preserve arbitrary tensor head/row strides.  Each thread moves
+            # individual bytes directly into the same XOR-permuted granules as
+            # the vectorized loader; this is the correctness fallback for views
+            # whose 128-byte head rows are not 16-byte vector-load compatible.
+            q_linear = tx
+            total_q_bytes = Int32(self.padded_q_heads * _INDEX_HEAD_DIM)
+            while q_linear < total_q_bytes:
+                head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
+                col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
+                vec_idx = col_idx // Int32(16)
+                byte_idx = col_idx - vec_idx * Int32(16)
+                tile_idx = head_idx // Int32(_PAGED_Q_HEAD_TILE)
+                row_in_tile = head_idx - tile_idx * Int32(_PAGED_Q_HEAD_TILE)
+                tile_base = q_smem_base_addr + tile_idx * Int32(
+                    _PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM
+                )
+                dst_addr = _smem_addr_from_b128_offset(
+                    tile_base,
+                    _permuted_offset_128b(
+                        row_in_tile, vec_idx, Int32(_INDEX_HEAD_DIM // 16)
+                    ),
+                ) + byte_idx
+                q_byte = cutlass.Uint8(0)
+                if head_idx < num_heads:
+                    q_byte = q_bytes[q_idx, head_idx, col_idx]
+                st_shared_u8(dst_addr, q_byte)
+                q_linear += Int32(_RADIX_THREADS)
         w_linear = tx
         while w_linear < Int32(self.padded_q_heads):
             s_w[w_linear] = (
@@ -1126,6 +1275,43 @@ class SparseNSAFusedIndexerKernel:
         token_group = warp_idx // Int32(self.num_q_head_tiles)
 
         carry_count = Int32(0)
+        # Paged-branch cp.async ping-pong: K alternates between k_page_perm
+        # (stage 0) and k_page (stage 1 -- unused as linear staging on the
+        # paged path); scales alternate scales/scales2. One page of lookahead.
+        scales_base_addr = shared_ptr_to_u32(storage.scales.data_ptr())
+        scales_ring_last = scales_base_addr + Int32(3 * _PAGE_SIZE * 4)
+        pipe_stage = Int32(0)
+        # Deferred-reduce pipeline (page_splits==1 paged flow): page p's reduce
+        # and carry append run at iteration p+1 BEHIND the pipeline barrier, so
+        # one barrier per page orders both the K stage and the partials handoff
+        # (the per-page reduce barrier disappears). Scales need a 3-deep ring
+        # because page p-1's scales are still live when p+1's are issued.
+        cur_scale_addr = scales_base_addr
+        prev_do = Int32(0)
+        prev_valid = Int32(0)
+        prev_out_base = Int32(0)
+        prev_scale_addr = scales_base_addr
+        prev_pl2 = Int32(0)
+        cur_pl2 = Int32(0)
+        if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
+            if page_start < page_end:
+                pid0 = Int32(-1)
+                if page_start < Int32(real_page_table.shape[1]):
+                    pid0 = Int32(real_page_table[q_idx, page_start])
+                if pid0 >= Int32(0):
+                    _stream_issue_k_page_cp_async(
+                        k_quant_bytes,
+                        k_scales,
+                        pid0,
+                        k_page_perm_base_addr,
+                        scales_base_addr,
+                        Int32(0),
+                        tx,
+                        k_quant_page_stride=int(self.k_quant_page_stride),
+                        k_scales_row_stride=int(self.k_scales_row_stride),
+                        issue_threads=_RADIX_THREADS,
+                    )
+            cute.arch.cp_async_commit_group()
         page_col = page_start
         while page_col < page_end:
             page_base = page_col * Int32(_PAGE_SIZE)
@@ -1145,19 +1331,97 @@ class SparseNSAFusedIndexerKernel:
                 if valid_slots > Int32(0):
                     do_page = Int32(1)
 
+            cur_k_base = k_page_perm_base_addr
+            cur_scale_base = scales_base_addr
+            nsc_ring = cur_scale_addr + Int32(_PAGE_SIZE * 4)
+            if nsc_ring > scales_ring_last:
+                nsc_ring = scales_base_addr
+            if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
+                # Issue the NEXT page into the K ring stage of page p-2. In the
+                # warp-specialized flow the producer first waits that stage's
+                # EMPTY barrier (all score warps released it), so no CTA
+                # barrier is needed; in the fallback flow the CTA barrier
+                # provides the same ordering.
+                nxt = page_col + Int32(1)
+                nxt_valid = Int32(0)
+                pid_n = Int32(-1)
+                if nxt < page_end:
+                    if nxt < Int32(real_page_table.shape[1]):
+                        pid_n = Int32(real_page_table[q_idx, nxt])
+                    if (pid_n >= Int32(0)) & (
+                        nxt * Int32(_PAGE_SIZE) < seq_len
+                    ):
+                        nxt_valid = Int32(1)
+                # stage((p+1) % 3): perm -> k_page -> k_page3 -> perm
+                nk = k_page_base_addr
+                if pipe_stage == Int32(1):
+                    nk = k_page3_base_addr
+                if pipe_stage == Int32(2):
+                    nk = k_page_perm_base_addr
+                if nxt_valid != Int32(0):
+                    _stream_issue_k_page_cp_async(
+                        k_quant_bytes,
+                        k_scales,
+                        pid_n,
+                        nk,
+                        nsc_ring,
+                        Int32(0),
+                        tx,
+                        k_quant_page_stride=int(self.k_quant_page_stride),
+                        k_scales_row_stride=int(self.k_scales_row_stride),
+                        issue_threads=_RADIX_THREADS,
+                    )
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(1)
+                cute.arch.sync_threads()
+                cur_scale_base = cur_scale_addr
+                if pipe_stage == Int32(1):
+                    cur_k_base = k_page_base_addr
+                if pipe_stage == Int32(2):
+                    cur_k_base = k_page3_base_addr
+                if cutlass.const_expr(self.page_splits == 1):
+                    # Reduce + append the PREVIOUS page: its partials (all
+                    # head tiles) and its scales are ordered by the pipeline
+                    # barrier above; the score of the current page then runs
+                    # into the other partials buffer with no trailing barrier.
+                    if prev_do != Int32(0):
+                        if tx < score_threads:
+                            if (head_tile_slot == Int32(0)) & (
+                                lane < Int32(_PAGED_TOKENS_PER_GROUP)
+                            ):
+                                slot_idx = token_group * Int32(
+                                    _PAGED_TOKENS_PER_GROUP
+                                ) + lane
+                                if slot_idx < prev_valid:
+                                    logit = Float32(0.0)
+                                    h_i = Int32(0)
+                                    if prev_pl2 == Int32(0):
+                                        while h_i < Int32(self.num_q_head_tiles):
+                                            logit = Float32(
+                                                logit + s_partial_logits[slot_idx, h_i]
+                                            )
+                                            h_i += Int32(1)
+                                    else:
+                                        while h_i < Int32(self.num_q_head_tiles):
+                                            logit = Float32(
+                                                logit + s_partial_logits2[slot_idx, h_i]
+                                            )
+                                            h_i += Int32(1)
+                                    s_c0_values[carry_count + slot_idx] = Float32(
+                                        logit
+                                        * ld_shared_f32(
+                                            prev_scale_addr + slot_idx * Int32(4)
+                                        )
+                                    )
+                                    s_c0_gindex[carry_count + slot_idx] = (
+                                        prev_out_base + slot_idx
+                                    )
+                        carry_count = carry_count + prev_valid
+                        prev_do = Int32(0)
             if do_page != Int32(0):
                 n_new = valid_slots
                 if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
-                    # Fused g2s load + permute (no linear staging, no repack pass).
-                    _load_permute_k_page_g2s(
-                        k_quant_bytes, page_id, Int64(self.k_quant_page_stride),
-                        k_page_perm_base_addr, tx, Int32(_RADIX_THREADS),
-                    )
-                    scale_idx = tx
-                    while scale_idx < Int32(_PAGE_SIZE):
-                        s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
-                        scale_idx += Int32(_RADIX_THREADS)
-                    cute.arch.sync_threads()
+                    pass
                 else:
                     # CONTIGUOUS_MLA: masked wide scalar load into linear staging, then repack.
                     _load_flat_k_tile_wide(
@@ -1177,65 +1441,133 @@ class SparseNSAFusedIndexerKernel:
                     )
                     cute.arch.sync_threads()
 
-                split_idx = Int32(0)
-                while split_idx < Int32(self.page_splits):
-                    # No partial-logits pre-zero: every group with token_base <
-                    # valid_slots runs the MMA (writing all its token columns for
-                    # all head tiles), and the reduce only reads slot_idx <
-                    # valid_slots -> it never consumes a stale (unwritten) partial.
-                    token_base = split_idx * Int32(self.tokens_per_work) + token_group * Int32(
-                        _PAGED_TOKENS_PER_GROUP
-                    )
+                if cutlass.const_expr(
+                    self.kv_layout == KV_LAYOUT_PAGED and self.page_splits == 1
+                ):
+                    tb_defer = token_group * Int32(_PAGED_TOKENS_PER_GROUP)
                     if tx < score_threads:
-                        if token_base < valid_slots:
-                            head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
-                            _compute_mxfp8_tile_partials(
-                                s_q,
-                                s_w,
-                                num_heads,
-                                k_page_perm_base_addr,
-                                token_base,
-                                head_tile_base,
-                                lane,
-                                s_partial_logits,
-                                token_group * Int32(_PAGED_TOKENS_PER_GROUP),
-                                head_tile_slot,
-                            )
-                    cute.arch.sync_threads()
-                    if tx < score_threads:
-                        if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
-                            slot_idx = token_base + lane
-                            if slot_idx < valid_slots:
-                                logit = Float32(0.0)
-                                partial_row = token_group * Int32(_PAGED_TOKENS_PER_GROUP) + lane
-                                h_i = Int32(0)
-                                while h_i < Int32(self.num_q_head_tiles):
-                                    logit = Float32(logit + s_partial_logits[partial_row, h_i])
-                                    h_i += Int32(1)
-                                s_c0_values[carry_count + slot_idx] = Float32(
-                                    logit * s_scale[slot_idx]
+                        if tb_defer < valid_slots:
+                            htb_defer = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
+                            if cur_pl2 == Int32(0):
+                                _compute_mxfp8_tile_partials_qldm(
+                                    q_smem_base_addr,
+                                    s_w,
+                                    num_heads,
+                                    cur_k_base,
+                                    tb_defer,
+                                    htb_defer,
+                                    head_tile_slot,
+                                    lane,
+                                    s_partial_logits,
+                                    token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                    head_tile_slot,
                                 )
-                                s_c0_gindex[carry_count + slot_idx] = abs_start + page_base + slot_idx
-                    # page_splits==1 (always for 1/2/4 head tiles): no post-reduce
-                    # barrier — the next page's load barrier (or the trim's leading
-                    # sync, or the pre-output sync) orders this reduce before any
-                    # later writer of s_partial_logits / reader of the carry. Multi-
-                    # split would need the barrier between splits, so keep it then.
-                    if cutlass.const_expr(self.page_splits > 1):
+                            else:
+                                _compute_mxfp8_tile_partials_qldm(
+                                    q_smem_base_addr,
+                                    s_w,
+                                    num_heads,
+                                    cur_k_base,
+                                    tb_defer,
+                                    htb_defer,
+                                    head_tile_slot,
+                                    lane,
+                                    s_partial_logits2,
+                                    token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                    head_tile_slot,
+                                )
+                    prev_do = Int32(1)
+                    prev_valid = valid_slots
+                    prev_scale_addr = cur_scale_addr
+                    prev_pl2 = cur_pl2
+                    cur_pl2 = cur_pl2 ^ Int32(1)
+                    prev_out_base = abs_start + page_base
+                    if cutlass.const_expr(self.paged_output):
+                        prev_out_base = page_id * Int32(_PAGE_SIZE)
+                else:
+                    split_idx = Int32(0)
+                    while split_idx < Int32(self.page_splits):
+                        # No partial-logits pre-zero: every group with token_base <
+                        # valid_slots runs the MMA (writing all its token columns for
+                        # all head tiles), and the reduce only reads slot_idx <
+                        # valid_slots -> it never consumes a stale (unwritten) partial.
+                        token_base = split_idx * Int32(self.tokens_per_work) + token_group * Int32(
+                            _PAGED_TOKENS_PER_GROUP
+                        )
+                        if tx < score_threads:
+                            if token_base < valid_slots:
+                                head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
+                                _compute_mxfp8_tile_partials_qldm(
+                                    q_smem_base_addr,
+                                    s_w,
+                                    num_heads,
+                                    cur_k_base,
+                                    token_base,
+                                    head_tile_base,
+                                    head_tile_slot,
+                                    lane,
+                                    s_partial_logits,
+                                    token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                    head_tile_slot,
+                                )
                         cute.arch.sync_threads()
-                    split_idx += Int32(1)
-
+                        if tx < score_threads:
+                            if (head_tile_slot == Int32(0)) & (lane < Int32(_PAGED_TOKENS_PER_GROUP)):
+                                slot_idx = token_base + lane
+                                if slot_idx < valid_slots:
+                                    logit = Float32(0.0)
+                                    partial_row = token_group * Int32(_PAGED_TOKENS_PER_GROUP) + lane
+                                    h_i = Int32(0)
+                                    while h_i < Int32(self.num_q_head_tiles):
+                                        logit = Float32(logit + s_partial_logits[partial_row, h_i])
+                                        h_i += Int32(1)
+                                    s_c0_values[carry_count + slot_idx] = Float32(
+                                        logit
+                                        * ld_shared_f32(
+                                            cur_scale_base + slot_idx * Int32(4)
+                                        )
+                                    )
+                                    output_idx = abs_start + page_base + slot_idx
+                                    if cutlass.const_expr(
+                                        self.kv_layout == KV_LAYOUT_PAGED
+                                        and self.paged_output
+                                    ):
+                                        output_idx = page_id * Int32(_PAGE_SIZE) + slot_idx
+                                    s_c0_gindex[carry_count + slot_idx] = output_idx
+                        # page_splits==1 (always for 1/2/4 head tiles): no post-reduce
+                        # barrier — the next page's load barrier (or the trim's leading
+                        # sync, or the pre-output sync) orders this reduce before any
+                        # later writer of s_partial_logits / reader of the carry. Multi-
+                        # split would need the barrier between splits, so keep it then.
+                        if cutlass.const_expr(self.page_splits > 1):
+                            cute.arch.sync_threads()
+                        split_idx += Int32(1)
             # ---- accumulate + conditional trim ----
-            # This page's n_new scored tokens were written into carry0[carry_count:].
-            if do_page != Int32(0):
-                carry_count = carry_count + n_new
-            # Trim carry0 back to topk only when the next page would overflow the
-            # over-sized accumulator, or at the very end. This runs the radix once per
-            # ~(_BATCH_SLACK/_PAGE_SIZE) pages instead of every page.
             is_last = page_col == (page_end - Int32(1))
-            need_trim = (carry_count + Int32(_PAGE_SIZE) > Int32(self.carry_cap)) | (
-                is_last & (carry_count > topk_static)
-            )
+            need_trim = Int32(0) != Int32(0)
+            if cutlass.const_expr(
+                self.kv_layout == KV_LAYOUT_PAGED and self.page_splits == 1
+            ):
+                # Deferred flow: the count already advanced at the deferred
+                # append; the current page appends next iteration (or in the
+                # post-loop tail), so only capacity pressure trims here -- the
+                # final trim runs after the loop.
+                need_trim = carry_count + Int32(_PAGE_SIZE) > Int32(self.carry_cap)
+            else:
+                # This page's n_new scored tokens were written into carry0[carry_count:].
+                if do_page != Int32(0):
+                    carry_count = carry_count + n_new
+                # Trim carry0 back to topk only when the next page would overflow the
+                # over-sized accumulator, or at the very end. This runs the radix once
+                # per ~(_BATCH_SLACK/_PAGE_SIZE) pages instead of every page.
+                need_trim = (carry_count + Int32(_PAGE_SIZE) > Int32(self.carry_cap)) | (
+                    is_last & (carry_count > topk_static)
+                )
+            if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
+                pipe_stage = pipe_stage + Int32(1)
+                if pipe_stage == Int32(3):
+                    pipe_stage = Int32(0)
+                cur_scale_addr = nsc_ring
             if need_trim:
                 cute.arch.sync_threads()
                 _fused_radix_select(
@@ -1255,6 +1587,55 @@ class SparseNSAFusedIndexerKernel:
             page_col += Int32(1)
 
         cute.arch.sync_threads()
+        if cutlass.const_expr(
+            self.kv_layout == KV_LAYOUT_PAGED and self.page_splits == 1
+        ):
+            # Drain the deferred pipeline: the last page's partials are ordered
+            # by the barrier above; append it, then run the final trim the
+            # in-loop path no longer performs.
+            if prev_do != Int32(0):
+                if tx < score_threads:
+                    if (head_tile_slot == Int32(0)) & (
+                        lane < Int32(_PAGED_TOKENS_PER_GROUP)
+                    ):
+                        slot_idx = token_group * Int32(_PAGED_TOKENS_PER_GROUP) + lane
+                        if slot_idx < prev_valid:
+                            logit = Float32(0.0)
+                            h_i = Int32(0)
+                            if prev_pl2 == Int32(0):
+                                while h_i < Int32(self.num_q_head_tiles):
+                                    logit = Float32(
+                                        logit + s_partial_logits[slot_idx, h_i]
+                                    )
+                                    h_i += Int32(1)
+                            else:
+                                while h_i < Int32(self.num_q_head_tiles):
+                                    logit = Float32(
+                                        logit + s_partial_logits2[slot_idx, h_i]
+                                    )
+                                    h_i += Int32(1)
+                            s_c0_values[carry_count + slot_idx] = Float32(
+                                logit
+                                * ld_shared_f32(prev_scale_addr + slot_idx * Int32(4))
+                            )
+                            s_c0_gindex[carry_count + slot_idx] = prev_out_base + slot_idx
+                carry_count = carry_count + prev_valid
+            if carry_count > topk_static:
+                cute.arch.sync_threads()
+                _fused_radix_select(
+                    s_c0_values, s_c0_gindex, s_c1_values, s_c1_gindex,
+                    carry_count, topk_static, self.cands, tx,
+                    s_hist0, s_hist1, s_out, s_cand0, s_cand1,
+                    h0, ctr, thr, ni0, ni1, lr,
+                )
+                cute.arch.sync_threads()
+                i = Int32(tx)
+                while i < topk_static:
+                    s_c0_values[i] = Float32(s_c1_values[i])
+                    s_c0_gindex[i] = Int32(s_c1_gindex[i])
+                    i += Int32(_RADIX_THREADS)
+                cute.arch.sync_threads()
+                carry_count = topk_static
         if cutlass.const_expr(not self.merge_in_kernel):
             # ---- single CTA per row: carry0 is already the final top-k ----
             i = Int32(tx)
@@ -1312,14 +1693,24 @@ class SparseNSAFusedIndexerKernel:
             ordered_pivot = Uint32(0)
             bucket_u32 = Uint32(0)
             c = Int32(0)
-            if seq_len > Int32(self.merge_threshold):
+            coop_possible = Int32(1 if self.coop_merge_possible else 0)
+            if (seq_len > Int32(self.merge_threshold)) & (
+                coop_possible != Int32(0)
+            ):
                 # group total candidate count (for the degenerate total <= topk path)
                 if tx == Int32(0):
                     atomic_add_global_i32(
-                        _global_state_ptr(merge_state, group_id, Int32(768)), carry_count
+                        _global_state_ptr(
+                            merge_state, group_id, Int32(_FUSED_STATE_TOTAL)
+                        ),
+                        carry_count,
                     )
                 barrier_phase = _group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
-                total = Int32(merge_state[_state_offset(group_id, Int32(768))])
+                total = Int32(
+                    merge_state[
+                        _state_offset(group_id, Int32(_FUSED_STATE_TOTAL))
+                    ]
+                )
                 if total <= topk_static:
                     # every candidate survives: pack contiguously (atomic base) + pad -1
                     if tx == Int32(0):
@@ -1470,6 +1861,34 @@ class SparseNSAFusedIndexerKernel:
                                 out_values[group_id, pos] = Float32(s_c0_values[i])
                                 out_indices[group_id, pos] = Int32(s_c0_gindex[i])
                         i += Int32(_RADIX_THREADS)
+
+                # Self-reset the cooperative state without a second grid
+                # barrier.  Each CTA publishes departure only after its final
+                # output/state use; the last departing CTA can therefore reset
+                # every cross-launch scalar safely.  This also permits graph
+                # replays to switch between cooperative and serial merge as the
+                # live seqlen changes, without a captured memset on every replay.
+                cute.arch.sync_threads()
+                if tx == Int32(0):
+                    cleanup_ptr = _global_state_ptr(
+                        merge_state, group_id, Int32(_FUSED_STATE_CLEANUP)
+                    )
+                    s_relay[0] = atomic_add_global_i32(cleanup_ptr, Int32(1))
+                cute.arch.sync_threads()
+                if Int32(s_relay[0]) == (ctas_pg - Int32(1)):
+                    if tx == Int32(0):
+                        merge_state[
+                            _state_offset(group_id, Int32(_STATE_OUTPUT_COUNTER))
+                        ] = Int32(0)
+                        merge_state[
+                            _state_offset(group_id, Int32(_STATE_ARRIVAL_COUNTER))
+                        ] = Int32(0)
+                        merge_state[
+                            _state_offset(group_id, Int32(_FUSED_STATE_TOTAL))
+                        ] = Int32(0)
+                        merge_state[
+                            _state_offset(group_id, Int32(_FUSED_STATE_CLEANUP))
+                        ] = Int32(0)
             else:
                 # ---- in-kernel cross-CTA merge (relay) ----
                 # Each CTA atomically packs its carry_count REAL candidates into the
@@ -1545,6 +1964,10 @@ def _build_fused_indexer_kernel(
     ctas_per_group: int,
     merge_threshold: int = _LAST_CTA_MERGE_MAX,
     k_quant_page_stride: int = _PAGE_SIZE * _INDEX_HEAD_DIM,
+    k_scales_row_stride: int = _PAGE_SIZE,
+    max_seq_capacity: int = 1 << 30,
+    vectorized_q_load: bool = False,
+    q_row_stride_bytes: int = 0,
 ):
     return SparseNSAFusedIndexerKernel(
         num_heads_static=num_heads_static,
@@ -1554,6 +1977,10 @@ def _build_fused_indexer_kernel(
         ctas_per_group=ctas_per_group,
         merge_threshold=merge_threshold,
         k_quant_page_stride=k_quant_page_stride,
+        k_scales_row_stride=k_scales_row_stride,
+        max_seq_capacity=max_seq_capacity,
+        vectorized_q_load=vectorized_q_load,
+        q_row_stride_bytes=q_row_stride_bytes,
     )
 
 
@@ -1673,6 +2100,8 @@ def run_fused_paged_indexer(
     pack_values: torch.Tensor | None = None,
     pack_indices: torch.Tensor | None = None,
     merge_state: torch.Tensor | None = None,
+    merge_state_preinitialized: bool = False,
+    output_physical_slots: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paged fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
     Returns (indices, values).
@@ -1680,8 +2109,10 @@ def run_fused_paged_indexer(
     pack_values/pack_indices/merge_state: optional caller-owned (workspace) scratch for
     serving. Size them with fused_indexer_scratch_capacity(max_rows, topk, num_sms) ONCE
     (fixed capacity, never grows -- the merge scratch is seq-independent). When omitted,
-    scratch is allocated per call (benchmarks/tests). merge_state is zeroed here each
-    call (cheap, graph-capturable); the kernel also self-resets its per-group counters.
+    scratch is allocated per call (benchmarks/tests). A caller-owned merge_state must
+    either be zero-initialized once and pass merge_state_preinitialized=True, or it is
+    zeroed here for backwards compatibility. Both merge arms self-reset every scalar
+    they carry across launches, so a preinitialized state needs no replay-time memset.
 
     merge_threshold drives the per-group runtime cross-CTA merge auto-switch: a row
     whose live seq_len <= merge_threshold uses the serial last-CTA reduction (no grid
@@ -1709,6 +2140,13 @@ def run_fused_paged_indexer(
         # the crossover, so force last-CTA. The kernel branches seq_len > merge_threshold;
         # since cap > C in the coop-reachable case, seq_len > C <=> min(seq,cap) > C.
         crossover = max(4096, 22000 + 117 * ctas_per_group - 13 * (int(topk) - 512))
+        # The original fit was dominated by the 64-head kernel. After vectorized
+        # query staging, GLM's 32-head/top-k-2048 path still favors the serial
+        # last-CTA reducer through 16k for B2-B5; cooperative merge only wins
+        # beyond that point. This floor is runtime-seqlen dispatch inside a
+        # capture-static kernel variant, and both arms self-reset for replay.
+        if int(num_heads) == 32 and int(topk) == 2048:
+            crossover = max(crossover, 16384)
         cap = ctas_per_group * int(topk)
         merge_threshold = crossover if cap > crossover else _FORCE_LAST_CTA
 
@@ -1723,9 +2161,8 @@ def run_fused_paged_indexer(
         else out_values
     )
     if pack_values is not None and pack_indices is not None and merge_state is not None:
-        # Workspace-owned fixed-capacity scratch. Slice to this launch's need and zero the
-        # state (the per-group counters; cheap and graph-capturable). Capacity is validated
-        # against fused_indexer_scratch_capacity by the workspace at allocation time.
+        # Workspace-owned fixed-capacity scratch. Capacity is validated against
+        # fused_indexer_scratch_capacity by the workspace at allocation time.
         pack_need = rows * ctas_per_group * int(topk)
         state_need = rows * _COOP_STATE_WORDS
         if pack_values.numel() < pack_need or pack_indices.numel() < pack_need:
@@ -1742,18 +2179,38 @@ def run_fused_paged_indexer(
         pack_v = pack_values[:pack_need]
         pack_i = pack_indices[:pack_need]
         state = merge_state[:state_need]
-        state.zero_()
+        if not bool(merge_state_preinitialized):
+            state.zero_()
     else:
         pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, ctas_per_group, dev)
     # Real dim-0 byte stride of the K-quant tensor: the packed paged cache interleaves
     # per-page scales (stride 8448), a plain [pages,64,128] view is contiguous (8192).
     # The wide g2s load must use this, not a hardcoded stride, to read the right page.
     k_quant_page_stride = int(k_quant_bytes.stride(0))
-    kernel = _build_fused_indexer_kernel(
-        KV_LAYOUT_PAGED, int(num_heads), int(topk), False, ctas_per_group,
-        merge_threshold=int(merge_threshold), k_quant_page_stride=k_quant_page_stride,
+    k_scales_row_stride = int(k_scales.stride(0))
+    vectorized_q_load = (
+        int(q_bytes.data_ptr()) % 16 == 0
+        and int(q_bytes.stride(2)) == 1
+        and int(q_bytes.stride(1)) == _INDEX_HEAD_DIM
+        and int(q_bytes.stride(0)) % 16 == 0
     )
-    dummy = torch.zeros((rows,), dtype=torch.int32, device=dev)  # k_start/k_end unused for paged
+    q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
+    kernel = _build_fused_indexer_kernel(
+        KV_LAYOUT_PAGED,
+        int(num_heads),
+        int(topk),
+        bool(output_physical_slots),
+        ctas_per_group,
+        merge_threshold=int(merge_threshold),
+        k_quant_page_stride=k_quant_page_stride,
+        k_scales_row_stride=k_scales_row_stride,
+        max_seq_capacity=max_pages * _PAGE_SIZE,
+        vectorized_q_load=vectorized_q_load,
+        q_row_stride_bytes=q_row_stride_bytes,
+    )
+    # k_start/k_end are constexpr-dead in the PAGED kernel. Reuse the existing
+    # int32 row metadata instead of capturing a pointless zero-fill kernel.
+    unused_k_bounds = seqlens
     args = (
         _to_kernel_tensor(q_bytes, cutlass.Uint8, assumed_align=4),
         _to_kernel_tensor(weights, cutlass.Float32, assumed_align=4),
@@ -1761,8 +2218,8 @@ def run_fused_paged_indexer(
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(real_page_table, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(dummy, cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(dummy, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(unused_k_bounds, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(unused_k_bounds, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(out_i, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(out_v, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(pack_v, cutlass.Float32, assumed_align=4),
@@ -1772,13 +2229,16 @@ def run_fused_paged_indexer(
     )
     key_tensors = [
         ("q", q_bytes), ("w", weights), ("kq", k_quant_bytes), ("ks", k_scales),
-        ("pt", real_page_table), ("sl", seqlens), ("kstart", dummy), ("kend", dummy),
+        ("pt", real_page_table), ("sl", seqlens),
+        ("kstart", unused_k_bounds), ("kend", unused_k_bounds),
         ("oi", out_i), ("ov", out_v), ("pv", pack_v), ("pi", pack_i), ("st", state),
     ]
     _launch_fused(
         kernel, args, key_tensors,
-        (KV_LAYOUT_PAGED, int(num_heads), int(topk), int(ctas_per_group),
-         int(merge_threshold), k_quant_page_stride),
+        (KV_LAYOUT_PAGED, int(num_heads), int(topk), bool(output_physical_slots), int(ctas_per_group),
+         int(merge_threshold), k_quant_page_stride, max_pages * _PAGE_SIZE,
+         k_scales_row_stride,
+         bool(vectorized_q_load), q_row_stride_bytes),
     )
     return out_i, out_v
 
@@ -1810,7 +2270,22 @@ def run_fused_indexer_mla(
         else out_values
     )
     pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, 1, dev)
-    kernel = _build_fused_indexer_kernel(KV_LAYOUT_CONTIGUOUS_MLA, int(num_heads), int(topk), False, 1)
+    vectorized_q_load = (
+        int(q_bytes.data_ptr()) % 16 == 0
+        and int(q_bytes.stride(2)) == 1
+        and int(q_bytes.stride(1)) == _INDEX_HEAD_DIM
+        and int(q_bytes.stride(0)) % 16 == 0
+    )
+    q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
+    kernel = _build_fused_indexer_kernel(
+        KV_LAYOUT_CONTIGUOUS_MLA,
+        int(num_heads),
+        int(topk),
+        False,
+        1,
+        vectorized_q_load=vectorized_q_load,
+        q_row_stride_bytes=q_row_stride_bytes,
+    )
     # page table / seqlens unused for FLAT; pass minimal dummies.
     dummy_pt = torch.zeros((rows, 1), dtype=torch.int32, device=dev)
     dummy_sl = torch.zeros((rows,), dtype=torch.int32, device=dev)
@@ -1836,6 +2311,16 @@ def run_fused_indexer_mla(
         ("oi", out_i), ("ov", out_v), ("pv", pack_v), ("pi", pack_i), ("st", state),
     ]
     _launch_fused(
-        kernel, args, key_tensors, (KV_LAYOUT_CONTIGUOUS_MLA, int(num_heads), int(topk), 1)
+        kernel,
+        args,
+        key_tensors,
+        (
+            KV_LAYOUT_CONTIGUOUS_MLA,
+            int(num_heads),
+            int(topk),
+            1,
+            bool(vectorized_q_load),
+            q_row_stride_bytes,
+        ),
     )
     return out_i, out_v

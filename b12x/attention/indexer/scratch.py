@@ -382,6 +382,7 @@ class B12XIndexerPagedScratch:
     fused_indexer_pack_values: torch.Tensor | None = None
     fused_indexer_pack_indices: torch.Tensor | None = None
     fused_indexer_merge_state: torch.Tensor | None = None
+    fused_indexer_merge_state_preinitialized: bool = False
     msa_page_scores: torch.Tensor | None = None
     msa_block_scores: torch.Tensor | None = None
     msa_q2k_indices: torch.Tensor | None = None
@@ -402,6 +403,7 @@ class B12XIndexerPagedScratch:
         schedule_metadata: torch.Tensor | None = None,
         expected_num_q_heads: int | None = None,
         shared_page_table: bool | None = None,
+        output_physical_slots: bool = False,
     ) -> "B12XIndexerPagedBinding":
         if shared_page_table is None:
             shared_page_table = bool(self.shared_page_table)
@@ -413,6 +415,7 @@ class B12XIndexerPagedScratch:
             schedule_metadata=schedule_metadata,
             expected_num_q_heads=expected_num_q_heads,
             shared_page_table=shared_page_table,
+            output_physical_slots=output_physical_slots,
         )
 
     def bind_msa(
@@ -635,6 +638,7 @@ class B12XIndexerPagedBinding:
     schedule_metadata: torch.Tensor | None = None
     expected_num_q_heads: int | None = None
     shared_page_table: bool = False
+    output_physical_slots: bool = False
     route: str = INDEXER_PAGED_ROUTE_TILED
     supertile_k: int | None = None
     prefill_block_k: int | None = None
@@ -695,11 +699,17 @@ class B12XIndexerMSAContiguousBinding:
     num_idx_heads: int | None = None
     strict: bool = True
 
-def _resolve_indexer_paged_supertile_tokens(raw_tokens: int) -> int:
+def _resolve_indexer_paged_supertile_tokens(
+    raw_tokens: int,
+    *,
+    capacity_tokens: int | None = None,
+) -> int:
+    use_capacity_default = False
     if int(raw_tokens) <= 0:
         raw = os.environ.get(_PAGED_INDEX_SUPERTILE_K_ENV)
         if raw is None:
             raw_tokens = _PAGED_INDEX_SUPERTILE_K_DEFAULT
+            use_capacity_default = True
         else:
             try:
                 raw_tokens = int(raw)
@@ -708,10 +718,22 @@ def _resolve_indexer_paged_supertile_tokens(raw_tokens: int) -> int:
                     f"{_PAGED_INDEX_SUPERTILE_K_ENV} must be an integer, got {raw!r}"
                 ) from exc
     tokens = max(int(raw_tokens), _PAGED_INDEX_TILE_BLOCK_K)
-    return (
+    tokens = (
         (tokens + _PAGED_INDEX_TILE_BLOCK_K - 1)
         // _PAGED_INDEX_TILE_BLOCK_K
     ) * _PAGED_INDEX_TILE_BLOCK_K
+    # The default is a chunk-size ceiling, not a request to reserve beyond the
+    # caller's fixed cache capacity. Keeping the explicit argument and env knob
+    # authoritative preserves tuning/debug behavior while making the normal
+    # vLLM plan proportional to its configured page-table width.
+    if use_capacity_default and capacity_tokens is not None:
+        capacity = max(int(capacity_tokens), 1)
+        capacity = (
+            (capacity + _PAGED_INDEX_TILE_BLOCK_K - 1)
+            // _PAGED_INDEX_TILE_BLOCK_K
+        ) * _PAGED_INDEX_TILE_BLOCK_K
+        tokens = min(tokens, max(capacity, _PAGED_INDEX_TILE_BLOCK_K))
+    return tokens
 
 
 def _resolve_indexer_paged_route(
@@ -736,6 +758,7 @@ def _resolve_indexer_paged_route(
                         topk=int(caps.topk),
                         num_rows=int(caps.max_q_rows),
                         width=int(width),
+                        num_heads=int(caps.num_q_heads),
                     )
                     and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4)
                 ):
@@ -771,6 +794,7 @@ def _resolve_indexer_paged_route(
                 topk=int(caps.topk),
                 num_rows=int(caps.max_q_rows),
                 width=int(width),
+                num_heads=int(caps.num_q_heads),
             )
             and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4)
         ):
@@ -790,7 +814,8 @@ def _indexer_paged_scratch_layout(
     max_q_rows = max(int(caps.max_q_rows), 1)
     page_size = max(int(caps.page_size), 1)
     supertile_tokens = _resolve_indexer_paged_supertile_tokens(
-        int(caps.paged_tile_logits_k_rows)
+        int(caps.paged_tile_logits_k_rows),
+        capacity_tokens=int(caps.max_page_table_width) * page_size,
     )
     if supertile_tokens % page_size != 0:
         raise ValueError(
@@ -1260,6 +1285,10 @@ def _materialize_indexer_paged_scratch(
             shape=(int(layout.fused_state_words),),
             dtype=torch.int32,
         )
+        # One-time initialization at workspace bind/materialization.  Both fused
+        # merge strategies restore their cross-launch counters before returning,
+        # so serving graph replays do not need to capture a state memset.
+        fused_merge_state.zero_()
     else:
         fused_pack_values = None
         fused_pack_indices = None
@@ -1378,6 +1407,7 @@ def _materialize_indexer_paged_scratch(
         fused_indexer_pack_values=fused_pack_values,
         fused_indexer_pack_indices=fused_pack_indices,
         fused_indexer_merge_state=fused_merge_state,
+        fused_indexer_merge_state_preinitialized=fused_merge_state is not None,
         msa_page_scores=msa_page_scores,
         msa_block_scores=msa_block_scores,
         msa_q2k_indices=msa_q2k_indices,
@@ -1637,6 +1667,7 @@ def build_indexer_paged_binding(
     schedule_metadata: torch.Tensor | None = None,
     expected_num_q_heads: int | None = None,
     shared_page_table: bool = False,
+    output_physical_slots: bool = False,
 ) -> B12XIndexerPagedBinding:
     if scratch is None:
         raise TypeError("build_indexer_paged_binding requires scratch")
@@ -1716,6 +1747,7 @@ def build_indexer_paged_binding(
         schedule_metadata=schedule_metadata,
         expected_num_q_heads=expected_num_q_heads,
         shared_page_table=bool(shared_page_table),
+        output_physical_slots=bool(output_physical_slots),
         route=str(getattr(scratch, "route", INDEXER_PAGED_ROUTE_TILED)),
         supertile_k=int(getattr(scratch, "paged_tile_logits_k_rows", 0)) or None,
         prefill_block_k=getattr(scratch, "prefill_block_k", None),
@@ -1991,6 +2023,7 @@ class B12XIndexerPagedScratchPlan:
         schedule_metadata: torch.Tensor | None = None,
         expected_num_q_heads: int | None = None,
         shared_page_table: bool | None = None,
+        output_physical_slots: bool = False,
     ) -> B12XIndexerPagedBinding:
         scratch_storage = scratch_tensor(
             scratch,
@@ -2012,6 +2045,7 @@ class B12XIndexerPagedScratchPlan:
             schedule_metadata=schedule_metadata,
             expected_num_q_heads=expected_num_q_heads,
             shared_page_table=shared_page_table,
+            output_physical_slots=output_physical_slots,
         )
 
     def bind_msa(

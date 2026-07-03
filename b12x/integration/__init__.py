@@ -49,10 +49,9 @@ from .residual import (
 )
 from .tp_moe import (
     B12XFP4ExpertWeights,
-    B12XPreparedFP4MoEWeights,
-    B12XPreparedW4A8TierWeights,
     B12XTopKRouting,
     TPMoEFP4Binding,
+    TPMoEPlan,
     TPMoERouteBinding,
     TPMoEScratchCaps,
     TPMoEScratchPlan,
@@ -64,7 +63,18 @@ from .tp_moe import (
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
     plan_tp_moe_scratch,
+    plan_tp_moe_execution,
+    plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
+)
+from .ep_moe import (
+    EPExpertMap,
+    EPMoEFP4Binding,
+    EPMoEScratchCaps,
+    EPMoEScratchPlan,
+    b12x_ep_moe_fp4,
+    plan_ep_moe_scratch,
+    prepare_ep_expert_map,
 )
 
 __all__ = [
@@ -107,10 +117,9 @@ __all__ = [
     "b12x_mhc_post_pre",
     "plan_mhc_scratch",
     "B12XFP4ExpertWeights",
-    "B12XPreparedFP4MoEWeights",
-    "B12XPreparedW4A8TierWeights",
     "B12XTopKRouting",
     "TPMoEFP4Binding",
+    "TPMoEPlan",
     "TPMoERouteBinding",
     "TPMoEScratchCaps",
     "TPMoEScratchPlan",
@@ -122,5 +131,14 @@ __all__ = [
     "build_tp_moe_route_binding",
     "build_tp_moe_sparse_fp4_binding",
     "plan_tp_moe_scratch",
+    "plan_tp_moe_execution",
+    "plan_b12x_fp4_moe_weights",
     "prepare_b12x_fp4_moe_weights",
+    "EPExpertMap",
+    "EPMoEFP4Binding",
+    "EPMoEScratchCaps",
+    "EPMoEScratchPlan",
+    "b12x_ep_moe_fp4",
+    "plan_ep_moe_scratch",
+    "prepare_ep_expert_map",
 ]

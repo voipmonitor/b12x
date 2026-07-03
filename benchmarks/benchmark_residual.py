@@ -4,13 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import math
 import os
 import pathlib
 import statistics
 import sys
-import types
 
 import torch
 import torch.nn.functional as F
@@ -158,121 +155,31 @@ def _bench_eager(fn, *, warmup: int, iters: int, l2_flush) -> tuple[float, float
 
 
 def _register_vllm_mhc_tilelang(vllm_path: pathlib.Path) -> None:
-    vllm_root = str(vllm_path.expanduser().resolve())
+    vllm_path = vllm_path.expanduser().resolve()
+    vllm_root = str(vllm_path)
     if vllm_root not in sys.path:
         sys.path.insert(1, vllm_root)
 
     try:
-        import tilelang  # noqa: F401
-    except ModuleNotFoundError:
-        vllm_site = next(
-            (
-                path
-                for path in (pathlib.Path(vllm_root) / ".venv" / "lib").glob(
-                    "python*/site-packages"
-                )
-                if (path / "tilelang").exists()
-            ),
-            None,
-        )
-        if vllm_site is None:
-            raise
-        sys.path.append(str(vllm_site))
-        import tilelang  # noqa: F401
-
-    def _package(name: str) -> types.ModuleType:
-        mod = sys.modules.get(name)
-        if mod is None:
-            mod = types.ModuleType(name)
-            mod.__path__ = []  # type: ignore[attr-defined]
-            sys.modules[name] = mod
-        if "." in name:
-            parent_name, child_name = name.rsplit(".", 1)
-            setattr(_package(parent_name), child_name, mod)
-        return mod
-
-    for package in (
-        "vllm",
-        "vllm.model_executor",
-        "vllm.model_executor.kernels",
-        "vllm.model_executor.kernels.mhc",
-        "vllm.platforms",
-        "vllm.utils",
-    ):
-        _package(package)
-
-    class _CurrentPlatform:
-        def is_cuda_alike(self) -> bool:
-            return True
-
-        def is_cuda(self) -> bool:
-            return True
-
-        def is_arch_support_pdl(self) -> bool:
-            return True
-
-    sys.modules["vllm.platforms"].current_platform = _CurrentPlatform()
-
-    import_utils = types.ModuleType("vllm.utils.import_utils")
-    import_utils.has_tilelang = lambda: True
-    sys.modules["vllm.utils.import_utils"] = import_utils
-    setattr(sys.modules["vllm.utils"], "import_utils", import_utils)
-
-    math_utils = types.ModuleType("vllm.utils.math_utils")
-    math_utils.cdiv = lambda a, b: int(math.ceil(a / b))
-    sys.modules["vllm.utils.math_utils"] = math_utils
-    setattr(sys.modules["vllm.utils"], "math_utils", math_utils)
-
-    deep_gemm = types.ModuleType("vllm.utils.deep_gemm")
-    deep_gemm.is_deep_gemm_supported = lambda: False
-
-    def _no_deep_gemm(*_args, **_kwargs):
-        raise RuntimeError("DeepGEMM is disabled in the direct vLLM MHC loader")
-
-    deep_gemm.tf32_hc_prenorm_gemm = _no_deep_gemm
-    sys.modules["vllm.utils.deep_gemm"] = deep_gemm
-    setattr(sys.modules["vllm.utils"], "deep_gemm", deep_gemm)
-
-    torch_utils = types.ModuleType("vllm.utils.torch_utils")
-
-    def direct_register_custom_op(
-        *,
-        op_name: str,
-        op_func,
-        mutates_args,
-        fake_impl=None,
-    ) -> None:
-        registered = torch.library.custom_op(
-            f"vllm::{op_name}",
-            mutates_args=tuple(mutates_args),
-        )(op_func)
-        if fake_impl is not None:
-            registered.register_fake(fake_impl)
-
-    torch_utils.direct_register_custom_op = direct_register_custom_op
-    sys.modules["vllm.utils.torch_utils"] = torch_utils
-    setattr(sys.modules["vllm.utils"], "torch_utils", torch_utils)
-
-    def _load_module(module_name: str, path: pathlib.Path) -> None:
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"failed to load module spec for {path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-
-    mhc_dir = pathlib.Path(vllm_root) / "vllm" / "model_executor" / "kernels" / "mhc"
-    _load_module(
-        "vllm.model_executor.kernels.mhc.tilelang_kernels",
-        mhc_dir / "tilelang_kernels.py",
-    )
-    _load_module(
-        "vllm.model_executor.kernels.mhc.tilelang",
-        mhc_dir / "tilelang.py",
-    )
+        import vllm.model_executor.kernels.mhc.tilelang  # noqa: F401
+    except (ImportError, OSError) as exc:
+        vllm_python = vllm_path / ".venv" / "bin" / "python"
+        raise RuntimeError(
+            "Failed to import the production vLLM mHC stack. Run this benchmark "
+            f"with {vllm_python} so TileLang and DeepGEMM come from the same "
+            "environment as vLLM."
+        ) from exc
 
     if not hasattr(torch.ops.vllm, "mhc_fused_post_pre_tilelang"):
         raise RuntimeError("vLLM mhc_fused_post_pre_tilelang custom op was not registered")
+
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    if not is_deep_gemm_supported():
+        raise RuntimeError(
+            "The production vLLM mHC comparison requires DeepGEMM, but vLLM "
+            "reported that DeepGEMM is disabled or unsupported in this environment."
+        )
 
 
 def main() -> None:
@@ -330,7 +237,7 @@ def main() -> None:
     parser.add_argument(
         "--vllm-path",
         type=pathlib.Path,
-        default=pathlib.Path("~/projects/vllm-other"),
+        default=pathlib.Path("~/projects/vllm"),
         help="Path to the vLLM checkout used for --compare-vllm.",
     )
     args = parser.parse_args()
@@ -354,8 +261,154 @@ def main() -> None:
         )
         != "0"
     )
+    prefill_policy_m = args.expected_m or args.tokens
+    prefill_tf32_min_tokens = int(
+        os.environ.get(
+            "B12X_MHC_PREFILL_TF32_MIN_TOKENS",
+            os.environ.get("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "384"),
+        )
+    )
+    prefill_tf32_selected = (
+        args.fuse_rmsnorm
+        and prefill_policy_m >= prefill_tf32_min_tokens
+        and prefill_tf32_enabled
+    )
     prefill_bf16_enabled = os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1") != "0"
     prefill_block_m_enabled = os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
+    prefill_gram_threads = int(
+        os.environ.get(
+            "B12X_MHC_PREFILL_GRAM_THREADS",
+            os.environ.get("B12X_MHC_PREFILL_THREADS", "1024"),
+        )
+    )
+    prefill_finalize_threads = int(
+        os.environ.get("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
+    )
+    prefill_tf32_tma_m_warps = int(
+        os.environ.get(
+            "B12X_MHC_PREFILL_TF32_TMA_M_WARPS",
+            os.environ.get(
+                "B12X_MHC_PREFILL_TF32_TMA_WARPS",
+                os.environ.get("B12X_MHC_PREFILL_TMA_WARPS", "1"),
+            ),
+        )
+    )
+    prefill_tf32_tma_n_warps = int(
+        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1")
+    )
+    prefill_tf32_tma_m = int(
+        os.environ.get(
+            "B12X_MHC_PREFILL_TF32_TMA_TILE_M",
+            os.environ.get("B12X_MHC_PREFILL_TMA_TILE_M", "16"),
+        )
+    )
+    prefill_tf32_tma_n = int(
+        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8")
+    )
+    prefill_tf32_tma_k = int(
+        os.environ.get(
+            "B12X_MHC_PREFILL_TF32_TMA_TILE_K",
+            os.environ.get("B12X_MHC_PREFILL_TMA_TILE_K", "256"),
+        )
+    )
+    prefill_tf32_tma_stages = int(
+        os.environ.get(
+            "B12X_MHC_PREFILL_TF32_TMA_STAGES",
+            os.environ.get("B12X_MHC_PREFILL_TMA_STAGES", "1"),
+        )
+    )
+    prefill_tf32_tma_chunk_min_tokens = int(
+        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
+    )
+    prefill_tf32_tma_chunk_geometry = (
+        args.tokens >= prefill_tf32_tma_chunk_min_tokens
+    )
+    prefill_tf32_tma_long_min_tokens = int(
+        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_MIN_TOKENS", "8192")
+    )
+    prefill_tf32_tma_long_geometry = (
+        args.hidden_size == 4096
+        and args.tokens >= prefill_tf32_tma_long_min_tokens
+    )
+    prefill_tf32_tma_k_splits = 1
+    if prefill_tf32_tma_chunk_geometry:
+        if args.hidden_size == 4096:
+            prefill_tf32_tma_m_warps = int(
+                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "12")
+            )
+            prefill_tf32_tma_n_warps = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
+                )
+            )
+            prefill_tf32_tma_m = int(
+                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "192")
+            )
+            prefill_tf32_tma_n = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "24"),
+                )
+            )
+            prefill_tf32_tma_k_splits = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_K_SPLITS", "8"
+                )
+            )
+            prefill_tf32_tma_k = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_K",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_K", "64"),
+                )
+            )
+            prefill_tf32_tma_stages = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_STAGES",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_STAGES", "2"),
+                )
+            )
+        else:
+            prefill_tf32_tma_m_warps = int(
+                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
+            )
+            prefill_tf32_tma_n_warps = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
+                )
+            )
+            prefill_tf32_tma_m = int(
+                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
+            )
+            prefill_tf32_tma_n = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
+                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"),
+                )
+            )
+    if prefill_tf32_tma_long_geometry:
+        prefill_tf32_tma_m_warps = int(
+            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_M_WARPS", "8")
+        )
+        prefill_tf32_tma_n_warps = int(
+            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_N_WARPS", "1")
+        )
+        prefill_tf32_tma_m = int(
+            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_M", "128")
+        )
+        prefill_tf32_tma_n = int(
+            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_N", "24")
+        )
+        prefill_tf32_tma_k = int(
+            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_K", "64")
+        )
+        prefill_tf32_tma_stages = int(
+            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_STAGES", "2")
+        )
+        prefill_tf32_tma_k_splits = int(
+            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
+        )
 
     device = require_sm120()
     if args.compare_vllm:
@@ -542,7 +595,17 @@ def main() -> None:
         f"mode={mode} tokens={args.tokens} expected_m={args.expected_m} "
         f"hidden={args.hidden_size} "
         f"split_k={args.split_k} block_k={args.block_k} block_h={args.block_h} "
+        f"fused_rmsnorm={args.fuse_rmsnorm} "
         f"prefill_tf32_mma={prefill_tf32_enabled} "
+        f"prefill_tf32_selected={prefill_tf32_selected} "
+        f"prefill_tf32_tma=m{prefill_tf32_tma_m}n{prefill_tf32_tma_n}"
+        f"k{prefill_tf32_tma_k}s{prefill_tf32_tma_stages}"
+        f"wm{prefill_tf32_tma_m_warps}wn{prefill_tf32_tma_n_warps} "
+        f"prefill_tf32_chunk_geometry={prefill_tf32_tma_chunk_geometry} "
+        f"prefill_tf32_long_geometry={prefill_tf32_tma_long_geometry} "
+        f"prefill_tf32_k_splits={prefill_tf32_tma_k_splits} "
+        f"prefill_gram_threads={prefill_gram_threads} "
+        f"prefill_finalize_threads={prefill_finalize_threads} "
         f"prefill_bf16_mma={prefill_bf16_enabled} "
         f"prefill_block_m={prefill_block_m_enabled} "
         f"prefill_block_m_size={args.prefill_block_m_size} "
@@ -561,6 +624,7 @@ def main() -> None:
         )
     if args.compare_vllm:
         line += (
+            " vllm_deep_gemm=True"
             f" vllm_post_pre_us={vllm_median:.2f}/{vllm_min:.2f} "
             f"b12x_vs_vllm={vllm_median / fused_median:.3f}x "
             f"vllm_y_max={vllm_y_max:.3g} vllm_y_rmse={vllm_y_rmse:.3g} "

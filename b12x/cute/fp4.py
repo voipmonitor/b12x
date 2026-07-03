@@ -28,7 +28,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 import torch.nn.functional as F
-from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
+from cutlass import Float32, Int32, Int64, Uint8, Uint16, Uint32, Uint64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -440,6 +440,29 @@ def ld_global_nc_u32(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def ld_global_b16(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
+    """Load one 16-bit global-memory payload into a 32-bit register.
+
+    PTX permits a bit-typed load into a wider bit register.  This is the form
+    emitted by FlashInfer for the DSV4 RoPE gather and avoids rounding the
+    address down to a word followed by a runtime halfword select.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "ld.global.b16 $0, [$1];",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def prefetch_global_l2(base_ptr: Int64, *, loc=None, ip=None) -> None:
     """Prefetch a global memory line into L2."""
     llvm.inline_asm(
@@ -512,35 +535,6 @@ def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
         ],
         "st.global.u64 [$0], $1;",
         "l,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def st_global_v4_u32(
-    base_ptr: Int64,
-    v0: Uint32,
-    v1: Uint32,
-    v2: Uint32,
-    v3: Uint32,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Store 128 bits (4 x uint32) to global memory."""
-    llvm.inline_asm(
-        None,
-        [
-            Int64(base_ptr).ir_value(loc=loc, ip=ip),
-            Uint32(v0).ir_value(loc=loc, ip=ip),
-            Uint32(v1).ir_value(loc=loc, ip=ip),
-            Uint32(v2).ir_value(loc=loc, ip=ip),
-            Uint32(v3).ir_value(loc=loc, ip=ip),
-        ],
-        "st.global.v4.u32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -727,6 +721,69 @@ def ldmatrix_m8n8x4_b16(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32,
     r2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
     r3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
     return Uint32(r0), Uint32(r1), Uint32(r2), Uint32(r3)
+
+
+@dsl_user_op
+def ld_shared_u16_offset(
+    smem_addr: Int32,
+    byte_offset: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint16:
+    """Load a shared halfword at a compile-time byte displacement.
+
+    Keeping the result as i16 lets NVVM select a PTX ``%rs`` operand and
+    avoids a redundant ``cvt.u16.u32`` before packed FP8 decode. Embedding the
+    displacement also avoids materializing one address register per unrolled
+    K step.
+    """
+    offset = int(byte_offset)
+    address = f"[$1+{offset}]" if offset else "[$1]"
+    return Uint16(
+        llvm.inline_asm(
+            T.i16(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            f"ld.shared.u16 $0, {address};",
+            "=h,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_shared_u8_offset(
+    smem_addr: Int32,
+    byte_offset: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    """Load one shared byte at a compile-time displacement, zero-extended.
+
+    This is the native ``ld.shared.u8`` form used for UE8M0 scale tables.  A
+    common row base plus an immediate displacement keeps the unrolled scale
+    cache free of word-alignment, shift, and mask instructions.
+    """
+    offset = int(byte_offset)
+    address = f"[$1+{offset}]" if offset else "[$1]"
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            f"ld.shared.u8 $0, {address};",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -973,6 +1030,56 @@ def cp_async_bulk_g2s_mbar(
 
 
 @dsl_user_op
+def create_l2_evict_first_policy(*, loc=None, ip=None) -> Uint64:
+    """Create an L2 evict-first policy for one-pass streaming cache rows."""
+    return Uint64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cp_async_bulk_g2s_mbar_l2hint(
+    smem_dst_u32: Int32,
+    gmem_src_i64: Int64,
+    nbytes: Int32,
+    mbar_u32: Int32,
+    cache_policy: Uint64,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Bulk global-to-shared copy with an explicit L2 cache policy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_dst_u32).ir_value(loc=loc, ip=ip),
+            Int64(gmem_src_i64).ir_value(loc=loc, ip=ip),
+            Int32(nbytes).ir_value(loc=loc, ip=ip),
+            Int32(mbar_u32).ir_value(loc=loc, ip=ip),
+            Uint64(cache_policy).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [$0], [$1], $2, [$3], $4;",
+        "r,l,r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
     """Store 8 bits to shared memory. smem_addr is a u32 shared-memory address."""
     llvm.inline_asm(
@@ -986,6 +1093,72 @@ def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def st_shared_u16(smem_addr: Int32, value: Uint32, *, loc=None, ip=None):
+    """Store the low 16 bits of a register to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.u16 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def quantize_scaled_store_shared_v2_e4m3(
+    smem_addr: Int32,
+    scaled_value0: Float32,
+    scaled_value1: Float32,
+    inv_scale: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Scale, quantize, and vector-store two contiguous E4M3 bytes.
+
+    ``scaled_value*`` already include the per-candidate V scale used by the
+    preceding atomic-max pass. Keeping that multiplication in ordinary SSA
+    lets LLVM retain/reuse the products across the barrier, as FlashInfer does.
+    The E4M3 results never widen through ``Uint32`` and are written with the
+    same half-register ``st.shared.v2.b8`` form.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Float32(scaled_value0).ir_value(loc=loc, ip=ip),
+            Float32(scaled_value1).ir_value(loc=loc, ip=ip),
+            Float32(inv_scale).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 q0, q1;
+            .reg .f32 zero, tmp;
+            mov.f32 zero, 0f00000000;
+            mul.f32 tmp, $1, $3;
+            cvt.rn.satfinite.e4m3x2.f32 q0, zero, tmp;
+            mul.f32 tmp, $2, $3;
+            cvt.rn.satfinite.e4m3x2.f32 q1, zero, tmp;
+            st.shared.v2.b8 [$0], {q0, q1};
+        }
+        """,
+        "r,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1143,6 +1316,54 @@ def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_add_global_f32(addr: Int64, val: Float32, *, loc=None, ip=None):
+    """No-return global fp32 add reduction (relaxed device scope)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cvt_bf16x2_to_f16x2(packed: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Convert a u32 holding two bf16 (lo, hi) into an f16x2 u32 (lo, hi)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(packed).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 blo, bhi, hlo, hhi;
+                .reg .f32 flo, fhi;
+                mov.b32 {blo, bhi}, $1;
+                cvt.f32.bf16 flo, blo;
+                cvt.f32.bf16 fhi, bhi;
+                cvt.rn.f16.f32 hlo, flo;
+                cvt.rn.f16.f32 hhi, fhi;
+                mov.b32 $0, {hlo, hhi};
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def red_add_global_bf16x2(addr: Int64, packed: Uint32, *, loc=None, ip=None):
     """No-return global atomic add of a packed bf16x2 value (2 contiguous bf16).
 
@@ -1236,38 +1457,55 @@ def atomic_add_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None) -> Int3
 
 
 @dsl_user_op
-def atomic_max_shared_f32(smem_addr: Int32, val: Float32, *, loc=None, ip=None) -> Float32:
-    """Shared-memory (CTA-scope) atomic max of a NON-NEGATIVE fp32 `val` into the
-    slot at 32-bit shared address `smem_addr`. Returns the resulting max.
+def atomic_max_shared_f32(smem_addr: Int32, val: Float32, *, loc=None, ip=None):
+    """No-return shared atomic max for a NON-NEGATIVE fp32 ``val``.
 
     Relies on the IEEE-754 ordering of non-negative floats matching the signed
     int ordering of their bit patterns, so the smem max can be done with a
-    single s32 atomic. Used by the running-max reduction of the sparse-MLA
-    softmax stage.
+    single s32 reduction. All callers consume the reduced shared slot after a
+    barrier; none needs the old or resulting value in the issuing lane.
     """
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [
-                Int32(smem_addr).ir_value(loc=loc, ip=ip),
-                Float32(val).ir_value(loc=loc, ip=ip),
-            ],
-            """
-            {
-                .reg .s32 vi, oldi, maxi;
-                mov.b32 vi, $2;
-                atom.shared.max.s32 oldi, [$1], vi;
-                max.s32 maxi, oldi, vi;
-                mov.b32 $0, maxi;
-            }
-            """,
-            "=f,r,f",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "{.reg .s32 vi; mov.b32 vi, $1; red.shared.max.s32 [$0], vi;}",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_max_shared_f32_offset(
+    smem_addr: Int32,
+    byte_offset: int,
+    val: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """No-return nonnegative FP32 shared max at a constant displacement."""
+    offset = int(byte_offset)
+    address = f"[$0+{offset}]" if offset else "[$0]"
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        f"{{.reg .s32 vi; mov.b32 vi, $1; red.shared.max.s32 {address}, vi;}}",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1405,6 +1643,32 @@ def ld_shared_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def ld_shared_f32_offset(
+    addr: Int32,
+    byte_offset: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Load shared FP32 using a compile-time displacement."""
+    offset = int(byte_offset)
+    address = f"[$1+{offset}]" if offset else "[$1]"
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            f"ld.shared.f32 $0, {address};",
+            "=f,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_shared_v4_f32(
     addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Float32, Float32, Float32, Float32]:
@@ -1456,6 +1720,34 @@ def st_shared_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
             Float32(val).ir_value(loc=loc, ip=ip),
         ],
         "st.shared.f32 [$0], $1;",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_shared_f32_offset(
+    addr: Int32,
+    byte_offset: int,
+    val: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store shared FP32 using a compile-time displacement."""
+    offset = int(byte_offset)
+    address = f"[$0+{offset}]" if offset else "[$0]"
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        f"st.shared.f32 {address}, $1;",
         "r,f",
         has_side_effects=True,
         is_align_stack=False,
@@ -2488,6 +2780,24 @@ def bf16_mma_m16n8k16_f32(
 
 
 @dsl_user_op
+def f32_to_raw_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
+    """Return the raw IEEE-754 bits of one float32 value."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def f32_to_tf32_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
     """Round one float32 value to TF32 format and return its 32-bit operand bits."""
     return Uint32(
@@ -2955,6 +3265,70 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
     r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
     r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
     return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
+def mxfp8_mma_m16n8k32_f32_e2m1(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+    tid_b: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """SM120 block-scaled QMMA with E4M3 A and E2M1 B containers."""
+    asm = f"""
+        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0
+        {{$0, $1, $2, $3}},
+        {{$4, $5, $6, $7}},
+        {{$8, $9}},
+        {{$0, $1, $2, $3}},
+        {{$10}},
+        {{{int(bid_a)}, {int(tid_a)}}},
+        {{$11}},
+        {{{int(bid_b)}, {int(tid_b)}}};
+        """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Uint32(sfa).ir_value(loc=loc, ip=ip),
+            Uint32(sfb).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,r,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
+    )
 
 
 @dsl_user_op
@@ -3470,7 +3844,7 @@ def cvt_w4a16_packed_e4m3_scale_to_f32(
 
 @dsl_user_op
 def dequant_kv_e4m3_pair_to_bf16x2(
-    p0: Uint32, p1: Uint32, scale_f: Float32, *, loc=None, ip=None
+    p0: Uint16, p1: Uint16, scale_f: Float32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:
     """FP8 -> BF16 K dequant for the BF16-QK m16n8k16 B operand.
 
@@ -3485,20 +3859,17 @@ def dequant_kv_e4m3_pair_to_bf16x2(
     res = llvm.inline_asm(
         ir.Type.parse("!llvm.struct<(i32, i32)>"),
         [
-            Uint32(p0).ir_value(loc=loc, ip=ip),
-            Uint32(p1).ir_value(loc=loc, ip=ip),
+            Uint16(p0).ir_value(loc=loc, ip=ip),
+            Uint16(p1).ir_value(loc=loc, ip=ip),
             Float32(scale_f).ir_value(loc=loc, ip=ip),
         ],
         """
         {
-            .reg .b16 pp0, pp1;
             .reg .b32 h2_0, h2_1;
             .reg .b16 l0, h0, l1, h1;
             .reg .f32 fk0, fk1, fk2, fk3;
-            cvt.u16.u32 pp0, $2;
-            cvt.u16.u32 pp1, $3;
-            cvt.rn.f16x2.e4m3x2 h2_0, pp0;
-            cvt.rn.f16x2.e4m3x2 h2_1, pp1;
+            cvt.rn.f16x2.e4m3x2 h2_0, $2;
+            cvt.rn.f16x2.e4m3x2 h2_1, $3;
             mov.b32 {l0, h0}, h2_0;
             mov.b32 {l1, h1}, h2_1;
             cvt.f32.f16 fk0, l0;
@@ -3513,7 +3884,7 @@ def dequant_kv_e4m3_pair_to_bf16x2(
             cvt.rn.bf16x2.f32 $1, fk3, fk2;
         }
         """,
-        "=r,=r,r,r,f",
+        "=r,=r,h,h,f",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -3684,6 +4055,43 @@ def fp4_decode_2(byte_val: Uint32, *, loc=None, ip=None) -> Uint32:
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def e2m1x8_to_qmma_e2m1x8(
+    packed_u32: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Spread eight packed FP4 nibbles into QMMA E2M1 byte containers.
+
+    The SM120 f8f6f4 instruction expects one E2M1 value per byte with the
+    original nibble in bits 5:2.  This six-instruction spread is cheaper than
+    losslessly relabeling every value as E4M3 when no residual multiplier is
+    required.
+    """
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed_u32).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 s, t;
+            shl.b32 s, $2, 2;
+            shr.u32 t, $2, 2;
+            prmt.b32 $0, s, t, 0x5140;
+            prmt.b32 $1, s, t, 0x7362;
+            and.b32 $0, $0, 0x3C3C3C3C;
+            and.b32 $1, $1, 0x3C3C3C3C;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
 
 
 @dsl_user_op
