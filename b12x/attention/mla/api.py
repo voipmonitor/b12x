@@ -369,6 +369,7 @@ def sparse_mla_decode_forward(
     identity_page_table: bool = False,
     backend: str | None = None,
     forced_num_splits: int | None = None,
+    scale_format: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q_all, page_table_1, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
         _resolve_sparse_mla_binding(
@@ -397,6 +398,7 @@ def sparse_mla_decode_forward(
         identity_page_table=identity_page_table,
         backend=backend,
         forced_num_splits=forced_num_splits,
+        scale_format=scale_format,
     )
 
 
@@ -413,6 +415,7 @@ def sparse_mla_extend_forward(
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
     identity_page_table: bool = False,
+    scale_format: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q_all, selected_token_offsets, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
         _resolve_sparse_mla_binding(
@@ -438,6 +441,7 @@ def sparse_mla_extend_forward(
         return_lse=return_lse,
         lse_scale=lse_scale,
         identity_page_table=identity_page_table,
+        scale_format=scale_format,
     )
 
 
@@ -457,6 +461,7 @@ def _run_sparse_mla(
     identity_page_table: bool = False,
     backend: str | None = None,
     forced_num_splits: int | None = None,
+    scale_format: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -544,6 +549,9 @@ def _run_sparse_mla(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
         )
     _sm120_route = _use_sm120_sparse_mla(backend=backend, device=q_all.device)
+    scale_format_for_call = (
+        scale_format if scale_format is not None else getattr(workspace, "scale_format", None)
+    )
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
         if not _sm120_route:
@@ -610,6 +618,7 @@ def _run_sparse_mla(
                 attn_sink=attn_sink,
                 return_lse=return_lse,
                 lse_scale=lse_scale,
+                scale_format=scale_format_for_call,
             )
         from .kernel import run_unified_decode
 
@@ -625,6 +634,7 @@ def _run_sparse_mla(
             return_lse=return_lse,
             lse_scale=lse_scale,
             forced_num_splits=forced_num_splits,
+            scale_format_override=scale_format_for_call,
         )
     if _is_cuda_graph_capture_active(q_all.device):
         raise RuntimeError(
@@ -665,6 +675,7 @@ def _run_sm120_prefill(
     attn_sink: torch.Tensor | None,
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
+    scale_format: int | None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a prefill-like call to the active SM120 single-pass prefill."""
     from .kernel import run_unified_prefill
@@ -683,6 +694,7 @@ def _run_sm120_prefill(
         topk_length=active_token_counts,
         attn_sink=attn_sink,
         output=output,
+        scale_format=scale_format,
     )
     if not return_lse:
         return output

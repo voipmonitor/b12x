@@ -212,6 +212,7 @@ def compressed_mla_decode_forward(
         return_lse=return_lse,
         lse_scale=lse_scale,
         out=out,
+        scale_format_override=getattr(scratch, "scale_format", None),
     )
 
 

@@ -34,6 +34,7 @@ from b12x.integration.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
+from b12x.attention.mla.traits import ScaleFormat
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -53,6 +54,8 @@ class B12XSparseMLAScratchCaps:
     max_chunks_per_row: int = 64
     max_q_chunks: int | None = None
     page_size: int = 64
+    kv_cache_dtype: str = "fp8_ds_mla"
+    scale_format: int | None = None
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -83,6 +86,20 @@ class B12XSparseMLAScratchCaps:
         if self.max_q_chunks is not None:
             object.__setattr__(self, "max_q_chunks", max(int(self.max_q_chunks), 1))
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
+        kv_cache_dtype = str(self.kv_cache_dtype)
+        object.__setattr__(self, "kv_cache_dtype", kv_cache_dtype)
+        scale_format = self.scale_format
+        if scale_format is None:
+            scale_format = (
+                ScaleFormat.NVFP4_E4M3
+                if kv_cache_dtype == "nvfp4_ds_mla"
+                else (
+                    ScaleFormat.UE8M0_BYTE
+                    if int(self.head_dim) == 512
+                    else ScaleFormat.ARBITRARY_FP32
+                )
+            )
+        object.__setattr__(self, "scale_format", int(scale_format))
 
 
 @dataclass(kw_only=True)
@@ -105,6 +122,8 @@ class B12XSparseMLAScratch:
     max_batch: int
     max_chunks_per_row: int
     page_size: int
+    kv_cache_dtype: str = "fp8_ds_mla"
+    scale_format: int = ScaleFormat.ARBITRARY_FP32
     mode: str = "decode"
     fixed_capacity: bool = True
     use_cuda_graph: bool = False
@@ -434,6 +453,8 @@ def _materialize_sparse_mla_scratch(
         max_batch=caps.max_batch,
         max_chunks_per_row=max_chunks_per_row,
         page_size=caps.page_size,
+        kv_cache_dtype=caps.kv_cache_dtype,
+        scale_format=int(caps.scale_format),
         mode=caps.mode,
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,

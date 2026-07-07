@@ -36,6 +36,7 @@ from b12x.cute.compiler import (
 from b12x.cute.fp4 import shared_ptr_to_u32
 
 from .decode_math import (
+    s0_load_q_bf16_to_smem,
     s0_quantize_q_to_smem,
     s1_qk_nope_block_scaled,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
@@ -58,6 +59,7 @@ from .io import io_issue_gather
 from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import (
     ModelType,
+    ScaleFormat,
     infer_model_type,
     make_unified_traits,
 )
@@ -716,17 +718,30 @@ class UnifiedDecodeKernel:
         else:
             # MATH WARPS (CONSUMER, warps 0-7 = 256 threads).
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
-            s0_quantize_q_to_smem(
-                q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
-                head_base, Int32(self.valid_hpb), tid,
-                d_nope=t.d_nope, d_rope=t.d_rope,
-                d_qk=t.d_nope + t.d_rope,
-                quant_tile=t.quant_tile, num_scales=t.num_scales,
-                hpb=(8 if self.native_h8 else t.hpb),
-                q_nope_stride=t.q_nope_stride,
-                q_rope_stride=L.q_rope_stride,
-                num_threads=self.math_threads, barrier_id=2,
-            )
+            if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+                # NVFP4 (never native_h8: run_unified_decode/_flat_launch gate
+                # scale_format==NVFP4_E4M3 out of the swap-AB paths): stage
+                # Q-NoPE + Q-RoPE as BF16, no FP8 Q quantization.
+                s0_load_q_bf16_to_smem(
+                    q_token, q_fp8_addr, q_rope_addr,
+                    head_base, Int32(self.valid_hpb), tid,
+                    d_nope=t.d_nope, d_rope=t.d_rope, hpb=t.hpb,
+                    q_nope_bf16_stride=t.q_nope_stride,
+                    q_rope_stride=L.q_rope_stride,
+                    num_threads=self.math_threads, barrier_id=2,
+                )
+            else:
+                s0_quantize_q_to_smem(
+                    q_token, q_fp8_addr, q_sc_view, q_rope_addr, amax_view,
+                    head_base, Int32(self.valid_hpb), tid,
+                    d_nope=t.d_nope, d_rope=t.d_rope,
+                    d_qk=t.d_nope + t.d_rope,
+                    quant_tile=t.quant_tile, num_scales=t.num_scales,
+                    hpb=(8 if self.native_h8 else t.hpb),
+                    q_nope_stride=t.q_nope_stride,
+                    q_rope_stride=L.q_rope_stride,
+                    num_threads=self.math_threads, barrier_id=2,
+                )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
             rope_acc_elems = 8 if self.native_dsv4_h8 else 4
@@ -900,6 +915,7 @@ class UnifiedDecodeKernel:
                         nt_per_warp_xv=t.nt_per_warp_xv,
                         scale_format=t.scale_format,
                         num_threads=self.math_threads, barrier_id=3,
+                        sm_p_full_addr=sm_p_full_addr,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -1436,21 +1452,34 @@ class UnifiedDecodeKernel:
                     cute.make_layout(int(L.w_head_sc_bytes // 4)),
                 )
 
-            s0_quantize_q_to_smem(
-                q_token, q_fp8_stage, q_sc_stage_view, q_rope_stage,
-                amax_stage_view,
-                head_base_stage,
-                Int32(8 if self.native_dsv4_h16 else self.valid_hpb),
-                tid_sel,
-                d_nope=t.d_nope, d_rope=t.d_rope,
-                d_qk=t.d_nope + t.d_rope,
-                quant_tile=t.quant_tile, num_scales=t.num_scales,
-                hpb=(8 if (self.native_h8 or self.native_dsv4_h16) else t.hpb),
-                q_nope_stride=t.q_nope_stride,
-                q_rope_stride=L.q_rope_stride,
-                num_threads=nt_stage, barrier_id=2,
-                barrier_threads=bt_stage,
-            )
+            if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+                # NVFP4 (GLM-only; never native_h8/native_dsv4_h16, so the
+                # stage aliases are identity): stage Q-NoPE + Q-RoPE as BF16.
+                s0_load_q_bf16_to_smem(
+                    q_token, q_fp8_stage, q_rope_stage,
+                    head_base_stage, Int32(self.valid_hpb), tid_sel,
+                    d_nope=t.d_nope, d_rope=t.d_rope, hpb=t.hpb,
+                    q_nope_bf16_stride=t.q_nope_stride,
+                    q_rope_stride=L.q_rope_stride,
+                    num_threads=nt_stage, barrier_id=2,
+                    barrier_threads=bt_stage,
+                )
+            else:
+                s0_quantize_q_to_smem(
+                    q_token, q_fp8_stage, q_sc_stage_view, q_rope_stage,
+                    amax_stage_view,
+                    head_base_stage,
+                    Int32(8 if self.native_dsv4_h16 else self.valid_hpb),
+                    tid_sel,
+                    d_nope=t.d_nope, d_rope=t.d_rope,
+                    d_qk=t.d_nope + t.d_rope,
+                    quant_tile=t.quant_tile, num_scales=t.num_scales,
+                    hpb=(8 if (self.native_h8 or self.native_dsv4_h16) else t.hpb),
+                    q_nope_stride=t.q_nope_stride,
+                    q_rope_stride=L.q_rope_stride,
+                    num_threads=nt_stage, barrier_id=2,
+                    barrier_threads=bt_stage,
+                )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
             rope_acc_elems = 8 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 4
@@ -1663,6 +1692,7 @@ class UnifiedDecodeKernel:
                         nt_per_warp_xv=t.nt_per_warp_xv,
                         scale_format=t.scale_format,
                         num_threads=self.math_threads, barrier_id=3,
+                        sm_p_full_addr=sm_p_full_addr,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -1797,11 +1827,15 @@ def _cache_block_stride_bytes(
     *,
     page_size: int,
     model_type: int,
+    glm_record_bytes: int | None = None,
 ) -> int:
     from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
 
     if int(model_type) == int(ModelType.GLM_NSA):
-        expected = int(page_size) * _GLM_KV_GMEM_STRIDE
+        # GLM-family record bytes: 656 (ARBITRARY_FP32) by default; NVFP4_E4M3
+        # callers pass traits.kv_gmem_stride (432) for the fp4 latent record.
+        record = _GLM_KV_GMEM_STRIDE if glm_record_bytes is None else int(glm_record_bytes)
+        expected = int(page_size) * record
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
     # Contiguous inputs are flattened before launch, so their original rank is
@@ -1864,6 +1898,9 @@ def _sparse_mla_decode_grid_flat_launch(
         and int(grid_h_blocks) == 1
         and int(head_block_offset) == 0
         and not bool(has_extra)
+        # NVFP4_E4M3 (432-byte fp4 latent record) has no swap-AB arm; keep it
+        # on the regular unified path (which carries the NVFP4 S0/S1/S6).
+        and int(scale_format) != int(ScaleFormat.NVFP4_E4M3)
         and _env_glm_h8_native_enabled()
     )
     native_dsv4_h8 = bool(
@@ -2186,6 +2223,7 @@ def run_unified_decode(
     lse_scale: str = "base2",
     forced_num_splits: int | None = None,
     out: torch.Tensor | None = None,
+    scale_format_override: int | None = None,
 ):
     """Active SM120 sparse-MLA decode: kernel (split-K partials) + merge.
 
@@ -2289,6 +2327,8 @@ def run_unified_decode(
     h_blocks = h_blocks_full + (1 if rem_heads else 0)
 
     model_type, compute_mode, scale_format = infer_model_type(q_head_dim, swa_k_cache.dtype)
+    if scale_format_override is not None:
+        scale_format = int(scale_format_override)
     traits = make_unified_traits(model_type, compute_mode, scale_format)
     d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
 
@@ -2419,6 +2459,8 @@ def run_unified_decode(
         int(model_type) == int(ModelType.GLM_NSA)
         and int(heads) == 8
         and not has_extra
+        # NVFP4_E4M3 has no swap-AB arm; stay on the regular unified path.
+        and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
         and _env_glm_h8_native_enabled()
     )
     native_h8 = native_glm_h8 or native_dsv4_h8
@@ -2472,10 +2514,14 @@ def run_unified_decode(
     mid_out = workspace.tmp_output[:rows, :heads, :num_splits, :d_v]
     mid_lse = workspace.tmp_lse[:rows, :heads, :num_splits]
 
+    # GLM record bytes come from traits (656 for ARBITRARY_FP32, 432 for
+    # NVFP4_E4M3); the helper still derives the actual per-block stride from
+    # the cache tensor for packed layouts.
     stride_kv_block = _cache_block_stride_bytes(
         swa_k_cache,
         page_size=int(swa_page_size),
         model_type=int(model_type),
+        glm_record_bytes=int(traits.kv_gmem_stride),
     )
 
     # ── EXTRA (indexed) cache views. When there is no extra cache they alias the
@@ -2533,8 +2579,8 @@ def run_unified_decode(
             extra_len_for_op,
             float(sm_scale),
             int(model_type),
-            int(compute_mode),
-            int(scale_format),
+            int(traits.compute_mode),
+            int(traits.scale_format),
             int(swa_page_size),
             int(topk),
             int(extra_topk),

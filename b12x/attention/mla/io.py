@@ -70,6 +70,14 @@ _GLM_GMEM_STRIDE = 656
 _GLM_NOPE_SCALE_BYTES = 528  # 512 e4m3 + 16 inline fp32; bulk #1 (-> kv_fp8 row).
 _GLM_ROPE_BYTES = 128        # 64 bf16; bulk #2 (-> kv_rope).
 
+# NVFP4 MLA latent layout: 256B E2M1 NoPE + 32B E4M3 scales + 16B pad + 128B
+# BF16 RoPE. The NoPE+scale+pad region is staged as a 288B row; decode math
+# dequants the E2M1 data and E4M3 group-16 scales in registers.
+_NVFP4_GMEM_STRIDE = 432
+_NVFP4_NOPE_SCALE_BYTES = 288
+_NVFP4_ROPE_BYTES = 128
+_NVFP4_ROPE_SRC = 304
+
 # IO warp width (one warp = 32 threads; FlashInfer DSV4_IO_THREADS).
 _IO_THREADS = 32
 
@@ -141,11 +149,17 @@ def io_issue_gather(
 
     # Per-model gmem geometry (const_expr). DSV4: 576B data + grouped 8B footer;
     # GLM: 656B contiguous (528 nope+inline-scales + 128 rope), NO footer.
+    # NVFP4: 432B contiguous (288 nope+E4M3-scales+pad + 128 rope), NO footer.
     if cutlass.const_expr(scale_format == 0):
         _IOS = Int64(_DSV4_IO_STRIDE)          # 576 per-token data stride
         _NOPE = Int32(_DSV4_NOPE_BYTES)        # 448 -> kv_fp8 (e4m3 nope)
         _ROPE = Int32(_DSV4_ROPE_BYTES)        # 128 -> kv_rope
         _ROPE_SRC = Int64(_DSV4_NOPE_BYTES)    # rope follows nope in the record
+    elif cutlass.const_expr(scale_format == 2):
+        _IOS = Int64(_NVFP4_GMEM_STRIDE)
+        _NOPE = Int32(_NVFP4_NOPE_SCALE_BYTES)
+        _ROPE = Int32(_NVFP4_ROPE_BYTES)
+        _ROPE_SRC = Int64(_NVFP4_ROPE_SRC)
     else:
         _IOS = Int64(_GLM_GMEM_STRIDE)         # 656 per-token contiguous record
         _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)   # 528 nope+inline-fp32 -> kv_fp8

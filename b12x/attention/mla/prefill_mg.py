@@ -26,9 +26,12 @@ from b12x.cute.fp4 import (
     atomic_max_shared_f32_offset,
     byte_perm,
     create_l2_evict_first_policy,
+    cvt_e4m3_to_f32_via_f16,
     dequant_kv_e4m3_pair_to_bf16x2,
+    f16x2_to_f32x2,
     fmax_f32,
     fmin_f32,
+    fp4_decode_2,
     get_ptr_as_int64,
     ld_global_b16,
     ld_global_nc_u32,
@@ -39,6 +42,7 @@ from b12x.cute.fp4 import (
     ldmatrix_m8n8x4_b16,
     mma_m16n8k16_f32_bf16,
     mma_m16n8k32_f32_e4m3,
+    pack_f32x2_to_bfloat2,
     quantize_scaled_store_shared_v2_e4m3,
     rcp_approx_ftz,
     shared_ptr_to_u32,
@@ -80,6 +84,10 @@ _DSV4_ROPE_GMEM_OFFSET = 448
 # 4*4 inline-scale bytes). MG reads it from global/L2 (no smem staging).
 _GLM_IO_STRIDE = 656
 _GLM_ROPE_GMEM_OFFSET = 528
+_NVFP4_IO_STRIDE = 432
+_NVFP4_ROPE_GMEM_OFFSET = 304
+_NVFP4_SCALE_OFFSET = 256
+_NVFP4_SCALE_GROUP = 16
 
 
 @cute.jit
@@ -178,11 +186,15 @@ def _cache_block_stride_bytes(
     *,
     page_size: int,
     is_glm: bool,
+    glm_record_bytes: int | None = None,
 ) -> int:
     from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
 
     if is_glm:
-        expected = int(page_size) * _GLM_IO_STRIDE
+        # GLM-family record bytes: 656 (ARBITRARY_FP32) by default; NVFP4_E4M3
+        # callers pass traits.kv_gmem_stride (432) for the fp4 latent record.
+        record = _GLM_IO_STRIDE if glm_record_bytes is None else int(glm_record_bytes)
+        expected = int(page_size) * record
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
     # Contiguous inputs are flattened before launch, so their original rank is
@@ -374,6 +386,19 @@ def _glm_rope_base_off(idx: Int32, page_block_size: Int32, stride_kv_block: Int6
 
 
 @cute.jit
+def _nvfp4_rope_base_off(idx: Int32, page_block_size: Int32, stride_kv_block: Int64) -> Int64:
+    if idx < Int32(0):
+        idx = Int32(0)
+    block_idx = idx // page_block_size
+    local_idx = idx - block_idx * page_block_size
+    return (
+        Int64(block_idx) * stride_kv_block
+        + Int64(local_idx) * Int64(_NVFP4_IO_STRIDE)
+        + Int64(_NVFP4_ROPE_GMEM_OFFSET)
+    )
+
+
+@cute.jit
 def _ld_global_glm_rope_u32(
     kv_cache_u8: cute.Tensor,
     rope_base: Int64,
@@ -382,6 +407,63 @@ def _ld_global_glm_rope_u32(
     """Load two consecutive bf16 rope elems (one u32) from global at rope_base +
     elem*2 bytes. ``elem`` is even (the lane reads bf16 pairs)."""
     return ld_global_nc_u32(get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem) * Int64(2)))
+
+
+@cute.jit
+def s2_qk_rope_regs_mg_nvfp4(
+    qk0,
+    qk1,
+    q_rope_regs0,
+    q_rope_regs1,
+    kv_cache_u8: cute.Tensor,
+    index_base_ptr: Int64,
+    warp_first_cand: Int32,
+    lane: Int32,
+    page_block_size: Int32,
+    stride_kv_block: Int64,
+    *,
+    d_rope: cutlass.Constexpr,
+    n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
+):
+    """NVFP4 MG QK-RoPE. Mirrors ``s2_qk_rope_regs_mg_glm`` (registerized Q-rope
+    A tuples, KV-rope B from global/L2, index read straight from the selected
+    topk tile) but with the 432-byte NVFP4 record and RoPE at offset 304. The B
+    operand depends only on the candidate token + rope chunk, so it is gathered
+    once and reused across both head groups (n_hg==2)."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    entry = warp_first_cand + gid
+    idx = _ld_global_index_i32(index_base_ptr, entry)
+    rope_base = _nvfp4_rope_base_off(idx, page_block_size, stride_kv_block)
+    hi0 = cutlass.const_expr(valid_hpb > 8)
+
+    for ks in cutlass.range_constexpr(d_rope // 16):
+        ko = Int32(ks) * Int32(16)
+        b0 = _ld_global_glm_rope_u32(kv_cache_u8, rope_base, ko + tid * Int32(2))
+        b1 = _ld_global_glm_rope_u32(
+            kv_cache_u8, rope_base, ko + tid * Int32(2) + Int32(8)
+        )
+        base = Int32(ks) * Int32(4)
+        d0, d1, d2, d3 = mma_m16n8k16_f32_bf16(
+            qk0[0], qk0[1], qk0[2], qk0[3],
+            q_rope_regs0[base + 0], q_rope_regs0[base + 1],
+            q_rope_regs0[base + 2], q_rope_regs0[base + 3],
+            b0, b1,
+        )
+        qk0[0] = d0
+        qk0[1] = d1
+        if cutlass.const_expr(hi0):
+            qk0[2] = d2
+            qk0[3] = d3
+        if cutlass.const_expr(n_hg == 2):
+            qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+                qk1[0], qk1[1], qk1[2], qk1[3],
+                q_rope_regs1[base + 0], q_rope_regs1[base + 1],
+                q_rope_regs1[base + 2], q_rope_regs1[base + 3],
+                b0, b1,
+            )
+    return qk0, qk1
 
 
 @cute.jit
@@ -859,6 +941,89 @@ def s2_qk_rope_shared_prefetched_mg_dsv4(
                 kv_rope_regs[bbase + 0],
                 kv_rope_regs[bbase + 1],
             )
+    return qk0, qk1
+
+
+@cute.jit
+def _nvfp4_pair_bfloat2_mg(
+    kv_fp4_base_addr: Int32,
+    entry: Int32,
+    dim_even: Int32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,
+) -> Uint32:
+    data_byte = _ld_u8_zext(
+        kv_fp4_base_addr,
+        entry * Int32(kv_smem_stride) + (dim_even // Int32(2)),
+    )
+    vals_h2 = fp4_decode_2(data_byte)
+    v0, v1 = f16x2_to_f32x2(vals_h2)
+    scale_group = dim_even // Int32(_NVFP4_SCALE_GROUP)
+    scale_byte = _ld_u8_zext(
+        kv_fp4_base_addr,
+        entry * Int32(kv_smem_stride)
+        + Int32(_NVFP4_SCALE_OFFSET)
+        + scale_group,
+    )
+    scale_f = cvt_e4m3_to_f32_via_f16(scale_byte)
+    return pack_f32x2_to_bfloat2(v0 * scale_f, v1 * scale_f)
+
+
+@cute.jit
+def s1_qk_nope_nvfp4_bf16_mg2(
+    qk0,
+    qk1,
+    q_nope_bf16_g0_addr: Int32,
+    q_nope_bf16_g1_addr: Int32,
+    kv_fp4_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    num_scales: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,
+    q_nope_bf16_stride: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    n_hg: cutlass.Constexpr = 2,
+):
+    """S1 (NVFP4): MG BF16 QK-NoPE with native E2M1/E4M3 dequant."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    kv_gid_row = warp_first_cand + gid
+
+    for blk in cutlass.range_constexpr(num_scales):
+        for ks in cutlass.range_constexpr(quant_tile // 16):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+            b0 = _nvfp4_pair_bfloat2_mg(
+                kv_fp4_base_addr,
+                kv_gid_row,
+                ko + tid * Int32(2),
+                kv_smem_stride=kv_smem_stride,
+            )
+            b1 = _nvfp4_pair_bfloat2_mg(
+                kv_fp4_base_addr,
+                kv_gid_row,
+                ko + tid * Int32(2) + Int32(8),
+                kv_smem_stride=kv_smem_stride,
+            )
+            a_byte = (
+                a_row * Int32(q_nope_bf16_stride * 2)
+                + (ko + a_col) * Int32(2)
+            )
+            a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
+                _smem_byte(q_nope_bf16_g0_addr, a_byte)
+            )
+            qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+                qk0[0], qk0[1], qk0[2], qk0[3], a00, a01, a02, a03, b0, b1
+            )
+            if cutlass.const_expr(n_hg == 2):
+                a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
+                    _smem_byte(q_nope_bf16_g1_addr, a_byte)
+                )
+                qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+                    qk1[0], qk1[1], qk1[2], qk1[3], a10, a11, a12, a13, b0, b1
+                )
     return qk0, qk1
 
 
@@ -1700,6 +1865,63 @@ def s6_xv_nope_mg_dsv4(
     return acc0, acc1
 
 
+@cute.jit
+def s5_fill_sm_p_full_mg2(
+    w_pre0,
+    w_pre1,
+    sm_p_g0_addr: Int32,
+    sm_p_g1_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    bi: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
+    n_hg: cutlass.Constexpr = 2,
+    sm_p_stride: cutlass.Constexpr = 0,  # bf16 elems per row; 0 -> BI (unpadded)
+):
+    """Store MG per-warp BF16 probabilities for NVFP4 BF16 P.V.
+
+    The MG layout aliases this tile onto the dead W_FP8 region with a padded
+    ``BI + 8`` row stride (bank-group rotation; smem_mg ``sm_p_full_stride``);
+    ``sm_p_stride`` carries that stride. The row/column mapping matches the
+    upstream DSV4 fused stage-P (each warp owns candidate columns
+    ``warp_id*8 + tid*2 (+1)`` for head rows ``gid`` / ``gid+8``)."""
+    row_stride = cutlass.const_expr(sm_p_stride if sm_p_stride else bi)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    cand_col_base = warp_id * Int32(8)
+    c0 = cand_col_base + tid * Int32(2)
+    c1 = c0 + Int32(1)
+
+    st_shared_bf16_from_f32(
+        sm_p_g0_addr + (gid * Int32(row_stride) + c0) * Int32(2), w_pre0[0]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_g0_addr + (gid * Int32(row_stride) + c1) * Int32(2), w_pre0[1]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_g0_addr + ((gid + Int32(8)) * Int32(row_stride) + c0) * Int32(2), w_pre0[2]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_g0_addr + ((gid + Int32(8)) * Int32(row_stride) + c1) * Int32(2), w_pre0[3]
+    )
+    if cutlass.const_expr(n_hg == 2):
+        st_shared_bf16_from_f32(
+            sm_p_g1_addr + (gid * Int32(row_stride) + c0) * Int32(2), w_pre1[0]
+        )
+        st_shared_bf16_from_f32(
+            sm_p_g1_addr + (gid * Int32(row_stride) + c1) * Int32(2), w_pre1[1]
+        )
+        st_shared_bf16_from_f32(
+            sm_p_g1_addr + ((gid + Int32(8)) * Int32(row_stride) + c0) * Int32(2),
+            w_pre1[2],
+        )
+        st_shared_bf16_from_f32(
+            sm_p_g1_addr + ((gid + Int32(8)) * Int32(row_stride) + c1) * Int32(2),
+            w_pre1[3],
+        )
+
+
 class UnifiedPrefillMGKernel:
     def __init__(
         self,
@@ -1966,6 +2188,8 @@ class UnifiedPrefillMGKernel:
         # Q-rope registerized (aliased onto W_FP8). DSV4 is the scale_format==0 /
         # has_extra arm and is byte-identical.
         is_glm = cutlass.const_expr(t.model_type == ModelType.GLM_NSA)
+        is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
+        is_glm_fp32 = cutlass.const_expr(is_glm and not is_nvfp4)
         q_head_dim = cutlass.const_expr(_GLM_HEAD_DIM if is_glm else _DSV4_HEAD_DIM)
         # Compile-time head-group count: 1 (heads==16) or 2 (heads % 32 == 0). All
         # group-1 work below const_expr-elides when n_hg==1 (single-group MG).
@@ -1979,7 +2203,9 @@ class UnifiedPrefillMGKernel:
         reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
         w_fp8_addr = shared_ptr_to_u32(st.w_fp8.data_ptr())
         # GLM has no kv_sc footer (its fp32 scales are inline).  DSV4 stages
-        # XV-RoPE weights into the W_FP8 region after XV-NoPE consumes it.
+        # XV-RoPE weights into the W_FP8 region after XV-NoPE consumes it;
+        # the NVFP4 BF16-P tile reuses that SAME dead region (sm_p_g0/sm_p_g1
+        # below), so no dedicated sm_p_full allocation exists in MG.
         if cutlass.const_expr(is_glm):
             kv_sc_addr = Int32(0)
         else:
@@ -2027,6 +2253,13 @@ class UnifiedPrefillMGKernel:
         # [par0:g0,g1][par1:g0,g1] interleave; only the per-group base differs).
         glm_w_fp8_g0 = w_fp8_addr
         glm_w_fp8_g1 = w_fp8_addr + Int32(2 * L.w_fp8_group_bytes)
+        # NVFP4 BF16 P.V tile bases: alias the dead W_FP8 region exactly like
+        # the DSV4 XV-RoPE weight tile (padded BI+8 stride per head-group; see
+        # smem_mg sm_p_full_*). Live only S5->S6 within a tile; Q-RoPE (also
+        # aliased there) is registerized at S0, and the next tile's S4 barrier
+        # orders tile N's S6 reads before tile N+1's S5 stores.
+        sm_p_g0 = w_fp8_addr
+        sm_p_g1 = w_fp8_addr + Int32(L.sm_p_full_group_bytes)
 
         if cutlass.const_expr(not bf16_qk):
             q_sc_g0 = cute.make_tensor(
@@ -2145,6 +2378,7 @@ class UnifiedPrefillMGKernel:
                         bi=t.bi,
                         kv_smem_stride=L.kv_smem_stride,
                         io_threads=_PREFILL_IO_THREADS,
+                        scale_format=t.scale_format,
                     )
                 else:
                     io_issue_gather_dsv4_nope(
@@ -2220,6 +2454,7 @@ class UnifiedPrefillMGKernel:
                                 bi=t.bi,
                                 kv_smem_stride=L.kv_smem_stride,
                                 io_threads=_PREFILL_IO_THREADS,
+                                scale_format=t.scale_format,
                             )
                     else:
                         g_start = next_lc * Int32(_CAND_WINDOW)
@@ -2241,6 +2476,7 @@ class UnifiedPrefillMGKernel:
                                 bi=t.bi,
                                 kv_smem_stride=L.kv_smem_stride,
                                 io_threads=_PREFILL_IO_THREADS,
+                                scale_format=t.scale_format,
                             )
                         else:
                             io_issue_gather_dsv4_nope(
@@ -2287,7 +2523,30 @@ class UnifiedPrefillMGKernel:
                     n_hg=n_hg,
                     valid_hpb=self.valid_hpb,
                 )
-                if cutlass.const_expr(not reload_bf16_qrope):
+                if cutlass.const_expr(is_nvfp4):
+                    # NVFP4 registerizes Q-rope tuple-style (the GLM FP8
+                    # convention below): s2_qk_rope_regs_mg_nvfp4 consumes
+                    # q_rope_regs0/1[base + i] directly, and the aliased W_FP8
+                    # scratch must be dead before the first tile's S5 P-staging.
+                    q_rope_regs0 = preload_q_rope_regs_mg(
+                        q_rope_g0,
+                        lane,
+                        d_rope=t.d_rope,
+                        q_rope_stride=L.q_rope_stride,
+                    )
+                    if cutlass.const_expr(n_hg == 2):
+                        q_rope_regs1 = preload_q_rope_regs_mg(
+                            q_rope_g1,
+                            lane,
+                            d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                        )
+                    else:
+                        q_rope_regs1 = q_rope_regs0  # never read when n_hg==1.
+                    cute.arch.barrier(
+                        barrier_id=2, number_of_threads=self.math_threads
+                    )
+                elif cutlass.const_expr(not reload_bf16_qrope):
                     (
                         q000, q001, q002, q003,
                         q010, q011, q012, q013,
@@ -2474,7 +2733,44 @@ class UnifiedPrefillMGKernel:
                 gs1 = [gsum1_frag[0], gsum1_frag[1]]
                 qk1 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
 
-                if cutlass.const_expr(bf16_qk):
+                if cutlass.const_expr(is_nvfp4):
+                    # NVFP4 (GLM 432-byte fp4 latent record): native E2M1 +
+                    # E4M3-group-16 in-register dequant feeding BF16 m16n8k16
+                    # MMAs -- the same math path as the fixed decode kernel.
+                    qk0, qk1 = s1_qk_nope_nvfp4_bf16_mg2(
+                        qk0,
+                        qk1,
+                        q_nope_bf16_g0,
+                        q_nope_bf16_g1,
+                        kv_fp8_b,
+                        warp_first_cand,
+                        lane,
+                        num_scales=t.num_scales,
+                        quant_tile=t.quant_tile,
+                        q_nope_bf16_stride=L.q_nope_bf16_stride,
+                        kv_smem_stride=L.kv_smem_stride,
+                        n_hg=n_hg,
+                    )
+                    # NVFP4 QK-RoPE: Q-rope A from the preloaded register
+                    # tuples (GLM FP8 convention), KV-rope B from global/L2
+                    # (BF16 rope at record offset 304), gathered once per tile
+                    # and reused across both head groups.
+                    qk0, qk1 = s2_qk_rope_regs_mg_nvfp4(
+                        qk0,
+                        qk1,
+                        q_rope_regs0,
+                        q_rope_regs1,
+                        rope_cache,
+                        index_base_ptr,
+                        warp_first_cand,
+                        lane,
+                        rope_pbs,
+                        rope_stride,
+                        d_rope=t.d_rope,
+                        n_hg=n_hg,
+                        valid_hpb=self.valid_hpb,
+                    )
+                elif cutlass.const_expr(bf16_qk):
                     if cutlass.const_expr(reload_bf16_qrope):
                         # Tile 0 consumes the S0 copy. S6 overwrites the aliased
                         # W_FP8 scratch, so restore only the 4 KiB Q-RoPE slice
@@ -2694,7 +2990,72 @@ class UnifiedPrefillMGKernel:
                 w_pre0 = [p0[0] * wr00, p0[1] * wr00, p0[2] * wr01, p0[3] * wr01]
                 w_pre1 = [p1[0] * wr10, p1[1] * wr10, p1[2] * wr11, p1[3] * wr11]
 
-                if cutlass.const_expr(is_glm):
+                if cutlass.const_expr(is_nvfp4):
+                    s5_fill_sm_p_full_mg2(
+                        w_pre0,
+                        w_pre1,
+                        sm_p_g0,
+                        sm_p_g1,
+                        warp_id,
+                        lane,
+                        bi=t.bi,
+                        hpb=t.hpb,
+                        n_hg=n_hg,
+                        sm_p_stride=L.sm_p_full_stride,
+                    )
+                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                    acc0 = s6_xv_nope(
+                        w_pre0,
+                        acc0,
+                        kv_fp8_b,
+                        kv_sc_b,
+                        w_head_sc_g0,
+                        glm_w_fp8_g0,
+                        warp_id,
+                        lane,
+                        tid,
+                        n_v_chunks=t.n_v_chunks,
+                        v_chunk=t.quant_tile,
+                        hpb=t.hpb,
+                        bi=t.bi,
+                        kv_smem_stride=L.kv_smem_stride,
+                        w_fp8_stride=t.bi + 16,
+                        n_warps=8,
+                        scale_bytes_per_token=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        scale_format=t.scale_format,
+                        num_threads=self.math_threads,
+                        barrier_id=3,
+                        sm_p_full_addr=sm_p_g0,
+                        sm_p_stride=L.sm_p_full_stride,
+                    )
+                    if cutlass.const_expr(n_hg == 2):
+                        acc1 = s6_xv_nope(
+                            w_pre1,
+                            acc1,
+                            kv_fp8_b,
+                            kv_sc_b,
+                            w_head_sc_g1,
+                            glm_w_fp8_g1,
+                            warp_id,
+                            lane,
+                            tid,
+                            n_v_chunks=t.n_v_chunks,
+                            v_chunk=t.quant_tile,
+                            hpb=t.hpb,
+                            bi=t.bi,
+                            kv_smem_stride=L.kv_smem_stride,
+                            w_fp8_stride=t.bi + 16,
+                            n_warps=8,
+                            scale_bytes_per_token=8,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            scale_format=t.scale_format,
+                            num_threads=self.math_threads,
+                            barrier_id=3,
+                            sm_p_full_addr=sm_p_g1,
+                            sm_p_stride=L.sm_p_full_stride,
+                        )
+                elif cutlass.const_expr(is_glm_fp32):
                     # GLM XV-NoPE: the per-group decode s6_xv_nope (raw-e4m3 V +
                     # per-(cand,vc) inline fp32 group scale + 2-pass W HIGH+LOW
                     # residual). V scales + V B operands come from the SHARED kv_fp8
@@ -3538,10 +3899,14 @@ def run_unified_prefill_mg(
         attn_sink_t = torch.zeros(1, dtype=torch.float32, device=device)
 
     if stride_kv_block is None:
+        # GLM record bytes come from traits (656 for ARBITRARY_FP32, 432 for
+        # NVFP4_E4M3); the helper still derives the actual per-block stride
+        # from the cache tensor for packed layouts.
         stride_kv_block = _cache_block_stride_bytes(
             kv_cache,
             page_size=int(page_block_size),
             is_glm=bool(is_glm),
+            glm_record_bytes=int(traits.kv_gmem_stride),
         )
 
     q = q.contiguous()

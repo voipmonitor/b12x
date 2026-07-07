@@ -216,9 +216,11 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     q_rope_bytes = hpb * d_rope * 2
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
-    # --- Q nope quantized to fp8 at Q_NOPE_STRIDE (448 + 16 pad). ---
+    # --- Q NoPE staging. FP8 paths use one byte/elem; NVFP4 Strategy-A decode
+    # stages BF16 Q-NoPE in this same byte-addressed region at D_NOPE+8 stride.
     q_fp8_off = off
-    q_fp8_bytes = hpb * q_nope_stride * 1
+    q_fp8_elem_bytes = 2 if traits.scale_format == 2 else 1
+    q_fp8_bytes = hpb * q_nope_stride * q_fp8_elem_bytes
     off = q_fp8_off + q_fp8_bytes
 
     # --- Q per-head scales: FP32 power-of-2 (converted to UE8M0 sfa at use). ---
@@ -230,7 +232,8 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # 128B-align the start of the (large) KV region for clean vectorized stores.
     off = _align_up(off, 128)
 
-    # --- Double-buffered KV nope (fp8) at KV_SMEM_STRIDE. ---
+    # --- Double-buffered KV NoPE region. FP8 paths stage raw E4M3; NVFP4 stages
+    # packed E2M1 data + E4M3 scales + pad in the 288-byte row.
     kv_fp8_off = off
     kv_fp8_buf_bytes = bi * kv_smem_stride
     off = kv_fp8_off + kv_fp8_buf_bytes * bufs
@@ -384,6 +387,8 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
 
     SharedStorage.__annotations__ = {
         # Q staging (single buffer). q_rope first (FlashInfer OFF_Q_ROPE = 0).
+        # q_fp8 is byte-addressed; for NVFP4 it holds BF16 Q-NoPE despite the
+        # historical field name.
         "q_rope": cute.struct.Align[
             cute.struct.MemRange[cutlass.BFloat16, int(layout.q_rope_bytes // 2)],
             128,
@@ -487,10 +492,14 @@ def _run_module_asserts() -> None:
 
     dsv4 = _assert_model(ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
+    nvfp4 = _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
     # Sanity on the expected magnitudes (~92KB DSV4, ~96KB GLM after the
     # double-buffered KV + footer + w_fp8 refinements).
     assert 80 * 1024 <= dsv4 <= 96 * 1024, f"DSV4 smem {dsv4}B outside ~92KB band"
     assert 88 * 1024 <= glm <= SM120_SMEM_CARVEOUT_BYTES, f"GLM smem {glm}B outside ~96KB band"
+    assert 70 * 1024 <= nvfp4 <= SM120_SMEM_CARVEOUT_BYTES, (
+        f"NVFP4 smem {nvfp4}B outside expected decode band"
+    )
 
 
 _run_module_asserts()

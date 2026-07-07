@@ -31,6 +31,7 @@ class ComputeMode:
 class ScaleFormat:
     UE8M0_BYTE = 0  # DSV4: power-of-2 exponent bytes in an 8B footer.
     ARBITRARY_FP32 = 1  # GLM: arbitrary FP32 inline scales (reference.py).
+    NVFP4_E4M3 = 2  # GLM/DS MLA latent: E2M1 data + E4M3 group-16 scales.
 
 
 @dataclass(frozen=True)
@@ -112,9 +113,36 @@ def make_unified_traits(
         )
 
     if model_type == ModelType.GLM_NSA:
+        if scale_format == ScaleFormat.NVFP4_E4M3:
+            # NVFP4 MLA latent cache: 256B packed E2M1 NoPE + 32B E4M3
+            # group-16 scales + 16B pad + 128B BF16 RoPE. Decode stages Q-NoPE
+            # as BF16 and dequants FP4 K/V in-register for BF16 QK/PV MMAs.
+            return UnifiedMLATraits(
+                model_type=ModelType.GLM_NSA,
+                compute_mode=ComputeMode.BF16,
+                scale_format=ScaleFormat.NVFP4_E4M3,
+                d_nope=512,
+                d_rope=64,
+                d_v=512,
+                quant_tile=64,
+                num_scales=8,  # logical FP4 steps; storage has 32 group-16 scales
+                n_v_chunks=8,
+                nt_per_warp_xv=1,
+                kv_gmem_stride=432,
+                kv_smem_stride=288,
+                q_nope_stride=520,  # BF16 Q-NoPE smem stride: D_NOPE + 8 elems.
+                bi=64,
+                hpb=16,
+                block_threads=288,
+                math_threads=256,
+                bulk_tx_bytes=26624,  # 64*(288+128)
+                v_has_rope=False,
+                has_extra_cache=False,
+            )
         if scale_format != ScaleFormat.ARBITRARY_FP32:
             raise ValueError(
-                "GLM_NSA requires ScaleFormat.ARBITRARY_FP32 (inline); "
+                "GLM_NSA requires ScaleFormat.ARBITRARY_FP32 (inline) or "
+                "ScaleFormat.NVFP4_E4M3; "
                 f"got scale_format={scale_format!r}"
             )
         # GLM_NSA column of verified_traits.md (ARBITRARY_FP32, V_HAS_ROPE=false).

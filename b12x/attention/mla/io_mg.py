@@ -33,6 +33,8 @@ _IO_THREADS = 128
 # issued here.
 _GLM_IO_STRIDE = 656
 _GLM_NOPE_SCALE_BYTES = 528
+_NVFP4_IO_STRIDE = 432
+_NVFP4_NOPE_SCALE_BYTES = 288
 
 
 @cute.jit
@@ -134,6 +136,7 @@ def io_issue_gather_glm_mg(
     bi: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,   # 528 (512 nope + 16 inline fp32 scales)
     io_threads: cutlass.Constexpr = _IO_THREADS,
+    scale_format: cutlass.Constexpr = 1,
 ):
     """Gather one BI=64 GLM prefill tile into MG smem.
 
@@ -144,11 +147,15 @@ def io_issue_gather_glm_mg(
     path -- RoPE is read from global/L2 by the math (NOT staged to smem), so the
     528-stride GLM KV fits the carveout for mg_n_hg==2. Single full mbarrier (the
     MG convention): the leader arrives + expect_tx over the BI 528B bulks."""
-    _ios = Int64(_GLM_IO_STRIDE)
-    _nope = Int32(_GLM_NOPE_SCALE_BYTES)
+    if cutlass.const_expr(scale_format == 2):
+        _ios = Int64(_NVFP4_IO_STRIDE)
+        _nope = Int32(_NVFP4_NOPE_SCALE_BYTES)
+    else:
+        _ios = Int64(_GLM_IO_STRIDE)
+        _nope = Int32(_GLM_NOPE_SCALE_BYTES)
 
     if io_lane == Int32(0):
-        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi * _GLM_NOPE_SCALE_BYTES))
+        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi) * _nope)
 
     full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
     eo = Int32(0)

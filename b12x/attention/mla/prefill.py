@@ -45,11 +45,15 @@ def _cache_block_stride_bytes(
     *,
     page_size: int,
     model_type: ModelType,
+    glm_record_bytes: int | None = None,
 ) -> int:
     from b12x.attention.mla.compressed_reference import compressed_mla_page_nbytes
 
     if model_type == ModelType.GLM_NSA:
-        expected = int(page_size) * _GLM_KV_GMEM_STRIDE
+        # GLM-family record bytes: 656 (ARBITRARY_FP32) by default; NVFP4_E4M3
+        # callers pass traits.kv_gmem_stride (432) for the fp4 latent record.
+        record = _GLM_KV_GMEM_STRIDE if glm_record_bytes is None else int(glm_record_bytes)
+        expected = int(page_size) * record
     else:
         expected = int(compressed_mla_page_nbytes(int(page_size)))
     # Contiguous inputs are flattened before launch, so their original rank is
@@ -109,6 +113,7 @@ def run_unified_prefill(
     extra_page_block_size: int | None = None,
     stride_extra_kv_block: int | None = None,
     workspace=None,
+    scale_format: int | None = None,
 ):
     """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + base-2 LSE.
 
@@ -168,7 +173,21 @@ def run_unified_prefill(
             f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
         )
 
-    model_type, compute_mode, scale_format = infer_model_type(q_head_dim, kv_cache.dtype)
+    model_type, compute_mode, inferred_scale_format = infer_model_type(
+        q_head_dim, kv_cache.dtype
+    )
+    if scale_format is None:
+        scale_format = inferred_scale_format
+    else:
+        scale_format = int(scale_format)
+        if q_head_dim == _GLM_HEAD_DIM and scale_format == ScaleFormat.NVFP4_E4M3:
+            compute_mode = ComputeMode.BF16
+        elif scale_format != inferred_scale_format:
+            raise ValueError(
+                "SM120 sparse MLA prefill scale_format does not match q_head_dim: "
+                f"q_head_dim={q_head_dim}, inferred={int(inferred_scale_format)}, "
+                f"override={int(scale_format)}"
+            )
     traits = make_unified_traits(model_type, compute_mode, scale_format)
     d_v = int(traits.d_v)
 
@@ -204,10 +223,14 @@ def run_unified_prefill(
         topk_length = topk_length.to(device=device, dtype=torch.int32).contiguous()
 
     if stride_kv_block is None:
+        # GLM record bytes come from traits (656 for ARBITRARY_FP32, 432 for
+        # NVFP4_E4M3); the helper still derives the actual per-block stride
+        # from the cache tensor for packed layouts.
         stride_kv_block = _cache_block_stride_bytes(
             kv_cache,
             page_size=int(page_block_size),
             model_type=model_type,
+            glm_record_bytes=int(traits.kv_gmem_stride),
         )
 
     q = q.contiguous()
@@ -306,6 +329,26 @@ def run_unified_prefill(
             model_type=ModelType.GLM_NSA,
             scale_format=ScaleFormat.ARBITRARY_FP32,
         )
+    # ── GLM NVFP4_E4M3 (432-byte fp4 latent record) MG gate ────────────────────
+    # Same MG structure as GLM ARBITRARY_FP32 but BF16 compute: S0 stages Q as
+    # BF16 (no FP8 Q-quant), S1/S6 dequant packed E2M1 + E4M3 group-16 scales
+    # in-register into BF16 MMAs. topk==128 is included (BF16-QK has no FP8
+    # Q-quant prologue to amortize, matching the DSV4 topk-128 BF16 rationale).
+    # NOTE: the 8-head tail partition (valid_hpb=8, TP8-style shards) rides the
+    # generic MG valid-head gating and is unvalidated for NVFP4; the validated
+    # envelope is heads==16 / heads%32==0 (TP4 serves heads==16).
+    _mg_nvfp4 = (
+        _mg_enabled
+        and not has_extra
+        and model_type == ModelType.GLM_NSA
+        and scale_format == ScaleFormat.NVFP4_E4M3
+    )
+    if _mg_nvfp4 and topk in (128, 512, 1024, 2048):
+        return _run_partitioned_mg(
+            compute_mode=ComputeMode.BF16,
+            model_type=ModelType.GLM_NSA,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+        )
     _mg_base = (
         _mg_enabled
         and not has_extra
@@ -359,6 +402,7 @@ def run_unified_prefill(
         "Supported (MG) shapes: single-cache heads%8==0; "
         "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 "
         "(BF16-QK, heads%8==0); "
+        "GLM NVFP4_E4M3 single-cache topk in {128, 512, 1024, 2048} (BF16-QK); "
         "DSV4 dual-cache topk==128 with heads%8==0 and pbs_extra in {2, 64}; "
         "GLM_NSA topk in {512, 1024, 2048}. No decode-reuse fallback."
     )

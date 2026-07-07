@@ -14,7 +14,7 @@ import cutlass
 import cutlass.cute as cute
 
 from .smem import SM120_SMEM_CARVEOUT_BYTES
-from .traits import ComputeMode, UnifiedMLATraits
+from .traits import ComputeMode, ScaleFormat, UnifiedMLATraits
 
 
 _MG_N_HG = 2
@@ -135,7 +135,8 @@ def make_smem_layout_mg(traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG) -> Sm
     # stride (448-B payload + 16-B pad) is part of the shared-memory bank layout,
     # not merely copy padding; FlashInfer retains it for BF16 QK as well.  The
     # XV-RoPE weights alias W_FP8 below, so the padded double buffer still fits
-    # the SM120 carveout.
+    # the SM120 carveout.  (NVFP4_E4M3 rides the same rule: its traits row is
+    # the 288-B packed E2M1 + E4M3-group-scales + pad row.)
     kv_smem_stride = traits.kv_smem_stride
 
     off = 0
@@ -463,6 +464,26 @@ def _run_module_asserts() -> None:
         assert gl.q_rope_off == gl.w_fp8_off  # Q-rope scratch aliases W_FP8.
         assert gl.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
             f"GLM MG prefill smem {gl.total_bytes}B exceeds SM120 carveout "
+            f"{SM120_SMEM_CARVEOUT_BYTES}B (mg_n_hg={nhg})"
+        )
+
+    nvfp4 = make_unified_traits(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
+    for nhg in (1, 2):
+        nl = make_smem_layout_mg(nvfp4, mg_n_hg=nhg)
+        assert nl.bf16_qk
+        assert nl.heads_per_cta == nhg * 16
+        assert nl.kv_smem_stride == 288
+        assert nl.kv_fp8_buf_bytes == 64 * 288
+        assert nl.kv_sc_buf_bytes == 0
+        assert nl.q_nope_bf16_stride == 512 + 8
+        assert nl.q_rope_off == nl.w_fp8_off
+        # NVFP4 BF16 P.V tile: same dead-W_FP8 alias + padded stride as the
+        # DSV4 XV-RoPE weight tile (native MG lifetime, no dedicated region).
+        assert nl.sm_p_full_off == nl.w_fp8_off
+        assert nl.sm_p_full_stride == 64 + 8
+        assert nl.sm_p_full_group_bytes == 16 * (64 + 8) * 2
+        assert nl.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
+            f"NVFP4 MG prefill smem {nl.total_bytes}B exceeds SM120 carveout "
             f"{SM120_SMEM_CARVEOUT_BYTES}B (mg_n_hg={nhg})"
         )
 
