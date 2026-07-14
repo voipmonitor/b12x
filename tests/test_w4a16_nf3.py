@@ -23,6 +23,9 @@ from b12x.moe.fused.w4a16.kernel import (
 )
 from b12x.moe.fused.w4a16.prepare import (
     _NF3_CODEBOOK,
+    _nf3_pack_scales,
+    _nf3_pack_selftest,
+    _permute_packed_scales,
     prepare_nf3_moe_weights,
 )
 from b12x.moe.fused.w4a16.host import (
@@ -34,6 +37,36 @@ from b12x.moe.fused.w4a16.host import (
 _DEVICE = torch.device("cuda")
 _DTYPE = torch.bfloat16
 _DEFAULT_MAX_SHARED_MEM = 101_376
+
+
+def test_nf3_cpu_packing_and_zero_scales() -> None:
+    _nf3_pack_selftest()
+
+    size_k = 64
+    size_n = 64
+    scales = torch.zeros((size_n, size_k // 32), dtype=torch.float32)
+    values = torch.tensor(
+        [0.0, 2.0**-10, 2.0**-9, 2.0**-7, 0.03125, 0.125, 0.5, 1.0],
+        dtype=torch.float32,
+    )
+    scales.reshape(-1)[: values.numel()] = values
+
+    packed = _nf3_pack_scales(scales, size_k=size_k, size_n=size_n)
+    permuted = _permute_packed_scales(
+        scales.T.contiguous(),
+        size_k=size_k,
+        size_n=size_n,
+        group_size=32,
+    )
+    permuted = permuted.view(-1, 4)[:, [0, 2, 1, 3]].view_as(permuted)
+
+    encoded_half = (permuted * (2.0**-4)).to(torch.float16).view(torch.int16)
+    expected = (encoded_half << 1).view(torch.uint8)[:, 1::2].contiguous()
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+
+    zero_mask = permuted == 0
+    assert torch.all(packed[zero_mask] == 0)
+    assert torch.all(packed[~zero_mask] != 0)
 
 
 def _round_to_e4m3_scale(t_s: torch.Tensor) -> torch.Tensor:
@@ -95,7 +128,11 @@ def _build_problem(m: int, seed: int = 0):
         0, 8, (num_experts, w13_rows, hidden), dtype=torch.int32, device=_DEVICE
     )
     w2_codes = torch.randint(
-        0, 8, (num_experts, hidden, intermediate_size), dtype=torch.int32, device=_DEVICE
+        0,
+        8,
+        (num_experts, hidden, intermediate_size),
+        dtype=torch.int32,
+        device=_DEVICE,
     )
     w13_scale = _round_to_e4m3_scale(
         0.01 + 0.24 * torch.rand(num_experts, w13_rows, hidden // 32, device=_DEVICE)
