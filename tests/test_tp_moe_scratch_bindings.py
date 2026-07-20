@@ -419,6 +419,54 @@ def test_tp_moe_scratch_plan_can_skip_route_scratch() -> None:
     assert plan.scratch_specs()[0].name == "tp_moe.scratch"
 
 
+def test_w4a8_tp6_materialized_scratch_uses_ceil_tiled_launch_n(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    weight_plan = _weight_plan(
+        "w4a8_mx",
+        source_format="fp4_e8m0_k32",
+        experts=256,
+        k=6144,
+        n=352,
+    )
+    plan = plan_tp_moe_scratch(
+        _caps(
+            weight_plan=weight_plan,
+            max_tokens=4096,
+            num_topk=8,
+            core_token_counts=(4096,),
+            route_num_experts=0,
+        )
+    )
+
+    core_plan = plan._core_workspace_plan
+    materialized = next(
+        spec
+        for spec in core_plan.tensor_specs
+        if spec.name == "materialized_intermediate"
+    )
+    tile_m, _ = tp_moe_impl._select_dynamic_tile_mn(
+        core_plan.routed_rows,
+        core_plan.n,
+        core_plan.quant_mode,
+        num_experts=core_plan.state_E,
+        activation=core_plan.activation,
+    )
+    launch_rows = int(core_plan.dynamic_physical_tiles) * tile_m
+    launch_n = tp_moe_impl.align_up(core_plan.n, 128)
+    required_nbytes = launch_rows * (launch_n + launch_n // 32)
+    available_nbytes = (
+        tp_moe_impl._tensor_numel(materialized.shape)
+        * tp_moe_impl._dtype_nbytes(materialized.dtype)
+    )
+
+    assert core_plan.n == 352
+    assert launch_n == 384
+    assert available_nbytes >= required_nbytes
+    assert available_nbytes - required_nbytes < core_plan.k * 2
+
+
 def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

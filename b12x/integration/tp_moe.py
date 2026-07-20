@@ -2598,9 +2598,16 @@ def _plan_core_workspace(
     # for non-W4A8 dynamic plans so every binding has an invariant ABI.
     materialized_intermediate_bytes = 16
     if _is_w4a8_quant_mode(quant_mode):
+        # Prepared W4A8-MX weights use ceil-tiled N128 storage.  The dynamic
+        # launch consumes that padded N extent for non-128-aligned virtual-TP
+        # shards (for example GLM's TP6 N=352 shard launches as N=384), so its
+        # materialized activation and scale planes must be sized the same way.
+        materialized_n = (
+            align_up(int(n), 128) if quant_mode == "w4a8_mx" else int(n)
+        )
         materialized_intermediate_bytes = max(
             16,
-            dynamic_rows_padded * (n + n // 32),
+            dynamic_rows_padded * (materialized_n + materialized_n // 32),
         )
     materialized_intermediate_rows = max(
         1,
