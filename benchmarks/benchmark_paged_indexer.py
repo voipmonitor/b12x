@@ -338,6 +338,20 @@ def main() -> None:
         help="use analytic inputs and validate every output row before timing",
     )
     parser.add_argument(
+        "--input-pattern",
+        choices=("random", "low-contrast", "equal"),
+        default="random",
+        help=(
+            "score-distribution stress case used when --check is absent; "
+            "low-contrast and equal inputs exercise crowded radix buckets"
+        ),
+    )
+    parser.add_argument(
+        "--indices-only",
+        action="store_true",
+        help="omit final top-k score output, matching sparse-attention serving",
+    )
+    parser.add_argument(
         "--nsys-capture",
         action="store_true",
         help="bracket one warmed graph replay with cudaProfilerStart/Stop",
@@ -349,6 +363,9 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=91_100)
     args = parser.parse_args()
+
+    if args.check and args.indices_only:
+        raise ValueError("--check requires score output and cannot use --indices-only")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -454,12 +471,27 @@ def main() -> None:
         weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
             device
         )
-        k_source = (
-            torch.randn((cache_tokens, 128), generator=gen, dtype=torch.float32).to(
-                device
+        if args.input_pattern == "random":
+            k_source = (
+                torch.randn((cache_tokens, 128), generator=gen, dtype=torch.float32).to(
+                    device
+                )
+                / 3
             )
-            / 3
-        )
+        else:
+            k_source = torch.full(
+                (cache_tokens, 128),
+                0.25,
+                dtype=torch.float32,
+                device=device,
+            )
+            if args.input_pattern == "low-contrast":
+                k_source.add_(
+                    torch.randn(
+                        (cache_tokens, 128), generator=gen, dtype=torch.float32
+                    ).to(device)
+                    / 4096
+                )
         packed_index_k_cache = pack_paged_index_k_cache_reference(k_source)
     # Match vLLM's rank-3 allocation, whose page bytes are planar
     # [64*128 quant][64*4 scales], then reproduce its zero-copy flattening for
@@ -638,7 +670,7 @@ def main() -> None:
                 num_heads=num_heads,
                 topk=topk,
                 out_indices=out_indices,
-                out_values=out_scores,
+                out_values=None if args.indices_only else out_scores,
                 ctas_per_group=fused_ctas,
                 merge_threshold=(
                     None
@@ -659,7 +691,7 @@ def main() -> None:
             topk=topk,
             expected_num_q_heads=num_heads,
             out_indices=out_indices,
-            out_scores=out_scores,
+            out_scores=None if args.indices_only else out_scores,
             supertile_k=supertile_k,
         )
 
@@ -864,6 +896,8 @@ def main() -> None:
         f"output_index_space={args.output_index_space} "
         f"requested_supertile_k={requested_supertile_k} "
         f"route={plan.layout.route} prefill_block_k={plan.layout.prefill_block_k} "
+        f"input_pattern={'analytic' if args.check else args.input_pattern} "
+        f"indices_only={bool(args.indices_only)} "
         f"scratch_mib={plan.layout.nbytes / (1024 * 1024):.2f} "
         f"output_shape={tuple(out.shape)} correctness={oracle_state} "
         f"median_us={median_us:.2f} min_us={min_us:.2f}"
